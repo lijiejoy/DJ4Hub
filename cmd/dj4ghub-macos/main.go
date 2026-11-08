@@ -134,6 +134,10 @@ func main() {
 }
 
 func serve(instance *app, listen string) {
+	instance.alertsStarted = time.Now()
+	if err := instance.initHistory(); err != nil {
+		log.Fatalf("open communication history: %v", err)
+	}
 	server := &http.Server{
 		Addr:              listen,
 		Handler:           localRequestPolicy(listen, instance.routes()),

@@ -18,6 +18,9 @@ type receivedSMS struct {
 	// Concat carries long-SMS reassembly metadata (USB-AT path only);
 	// nil for single-part messages. Persisted to history for dedup.
 	Concat *smscodec.ConcatInfo `json:"-"`
+	// Memory 是短信所在的存储位置（SM=SIM 卡，ME=模块）；
+	// 上游通信历史据此判定卡归属，未设置时按归属未知处理。
+	Memory string `json:"memory,omitempty"`
 }
 
 func (a *app) recordSMS(sender, content string, timestamp time.Time) {

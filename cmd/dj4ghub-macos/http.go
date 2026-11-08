@@ -19,6 +19,21 @@ func (a *app) routes() http.Handler {
 	a.registerCallsRoutes(mux)
 	a.registerConversationsRoutes(mux)
 	a.registerDiagnosticsRoutes(mux)
+
+	// 上游功能路由（612c2f6 原生客户端/通信历史/云盘备份、45622dc 音频诊断）：
+	// 与本地 history/calls/sms 路由并存，统一方案待步骤 08 决定。
+	mux.HandleFunc("GET /api/history", a.listHistory)
+	mux.HandleFunc("GET /api/history/backup", a.historyBackupStatus)
+	mux.HandleFunc("POST /api/history/backup", a.historyBackupAction)
+	mux.HandleFunc("GET /api/alerts", a.communicationAlerts)
+	mux.HandleFunc("GET /api/calls", a.callStatus)
+	mux.HandleFunc("POST /api/calls", a.callAction)
+	mux.HandleFunc("GET /api/calls/audio", a.moduleAudioStatus)
+	mux.HandleFunc("POST /api/calls/audio/prepare", a.moduleAudioPrepare)
+	mux.HandleFunc("POST /api/calls/audio/lease", a.moduleAudioLease)
+	mux.HandleFunc("POST /api/calls/audio/stop", a.moduleAudioStop)
+	mux.HandleFunc("POST /api/network/apn", a.saveAPN)
+	mux.HandleFunc("POST /api/network/enable-service", a.enableNetworkService)
 	mux.HandleFunc("GET /api/sms", a.listSMS)
 	mux.HandleFunc("GET /api/sms/status", a.smsStatus)
 	mux.HandleFunc("POST /api/sms/send", a.sendSMS)

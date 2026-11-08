@@ -45,6 +45,17 @@ type app struct {
 	trafficMu        sync.Mutex
 	trafficBaselines map[string]networkByteCounters
 
+	// 上游通信历史（612c2f6 合并引入）：与本地 SQLite 历史（internal/history）并存，
+	// 统一方案待步骤 08 决定，此处仅保证两套系统各自可用。
+	alertsStarted time.Time
+	historyMu     sync.Mutex
+	history       *communicationHistory
+
+	// 上游模块音频（45622dc 合并引入）：module_audio.go 的会话锁与当前会话；
+	// 与 SIP 音频桥（sipAudio）并存，统一方案待步骤 08 决定。
+	audioMu      sync.Mutex
+	audioSession *moduleAudioSession
+
 	sip               *sip.Server
 	sipDir            string
 	sipAudio          *sip.CallAudioBridge
