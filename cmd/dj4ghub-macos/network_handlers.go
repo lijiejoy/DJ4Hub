@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/csv"
+	"encoding/xml"
 	"fmt"
 	"log"
 	"net"
@@ -36,10 +37,11 @@ type pdpContext struct {
 }
 
 type macNetInterface struct {
-	Name   string `json:"name"`
-	Status string `json:"status"`
-	IPv4   string `json:"ipv4"`
-	Kind   string `json:"kind"`
+	Name     string `json:"name"`
+	Status   string `json:"status"`
+	IPv4     string `json:"ipv4"`
+	Kind     string `json:"kind"`
+	ModuleID string `json:"module_id,omitempty"`
 }
 
 type macDefaultRoute struct {
@@ -83,6 +85,7 @@ type networkByteCounters struct {
 type networkTrafficSnapshot struct {
 	Available    bool   `json:"available"`
 	Interface    string `json:"interface,omitempty"`
+	CounterID    string `json:"counter_id,omitempty"`
 	RXBytes      uint64 `json:"rx_bytes"`
 	TXBytes      uint64 `json:"tx_bytes"`
 	SessionRX    uint64 `json:"session_rx_bytes"`
@@ -189,9 +192,9 @@ func (a *app) networkActivity(w http.ResponseWriter, _ *http.Request) {
 			break
 		}
 	}
-	tunnel := route.Interface
-	if tunnel == "" {
-		tunnel = physical
+	tunnel := physical
+	if strings.HasPrefix(route.Interface, "utun") {
+		tunnel = route.Interface
 	}
 	snapshot.TunnelInterface = tunnel
 
@@ -213,7 +216,8 @@ func (a *app) networkActivity(w http.ResponseWriter, _ *http.Request) {
 	for range 2 {
 		all = append(all, (<-results).records...)
 	}
-	activityInterface := tunnel
+	// A tunnel's default route does not prove its traffic uses this module.
+	activityInterface := physical
 	for _, item := range all {
 		if item.Interface == physical {
 			snapshot.PhysicalActive = true
@@ -308,6 +312,12 @@ func (a *app) networkTraffic(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, snapshot)
 		return
 	}
+	for _, item := range interfaces {
+		if item.Name == name {
+			snapshot.CounterID = item.ModuleID
+			break
+		}
+	}
 	counters, err := discoverMacInterfaceCounters()
 	if err != nil {
 		snapshot.Interface = name
@@ -327,10 +337,11 @@ func (a *app) networkTraffic(w http.ResponseWriter, _ *http.Request) {
 	if a.trafficBaselines == nil {
 		a.trafficBaselines = make(map[string]networkByteCounters)
 	}
-	baseline, exists := a.trafficBaselines[name]
+	counterKey := name + ":" + snapshot.CounterID
+	baseline, exists := a.trafficBaselines[counterKey]
 	if !exists || current.RX < baseline.RX || current.TX < baseline.TX {
 		baseline = current
-		a.trafficBaselines[name] = baseline
+		a.trafficBaselines[counterKey] = baseline
 	}
 	a.trafficMu.Unlock()
 
@@ -366,7 +377,7 @@ func (a *app) check4GRoute(w http.ResponseWriter, _ *http.Request) {
 		})
 		return
 	}
-	if active != nil && active.Name != "en0" && active.Kind == "ethernet" && active.Status == "active" {
+	if active != nil && active.ModuleID != "" && active.Kind == "ethernet" && active.Status == "active" {
 		writeJSON(w, http.StatusOK, networkCheckResult{
 			OK:      true,
 			Summary: "当前正在走 4G 模块",
@@ -509,6 +520,7 @@ func discoverMacNetworkInterfaces() []macNetInterface {
 	if err != nil {
 		return nil
 	}
+	identities := discoverModuleNetworkIdentities()
 	var interfaces []macNetInterface
 	for _, block := range splitIfconfigBlocks(string(out)) {
 		block = strings.TrimSpace(block)
@@ -527,7 +539,7 @@ func discoverMacNetworkInterfaces() []macNetInterface {
 		if name == "" || strings.HasPrefix(name, "lo") || strings.HasPrefix(name, "utun") {
 			continue
 		}
-		item := macNetInterface{Name: name, Status: "unknown", Kind: classifyMacInterfaceName(name)}
+		item := macNetInterface{Name: name, Status: "unknown", Kind: classifyMacInterfaceName(name), ModuleID: identities[name]}
 		for _, line := range lines {
 			line = strings.TrimSpace(line)
 			if strings.HasPrefix(line, "status:") {
@@ -602,7 +614,7 @@ func classifyMacInterfaceName(name string) string {
 
 func hasLikelyUSBNetworkInterface(interfaces []macNetInterface) bool {
 	for _, item := range interfaces {
-		if item.Kind == "ethernet" && item.Name != "en0" && item.Status == "active" {
+		if item.ModuleID != "" && item.Kind == "ethernet" && item.Status == "active" {
 			return true
 		}
 	}
@@ -611,16 +623,74 @@ func hasLikelyUSBNetworkInterface(interfaces []macNetInterface) bool {
 
 func selectUSBTrafficInterface(interfaces []macNetInterface, route macDefaultRoute) string {
 	for _, item := range interfaces {
-		if item.Name == route.Interface && item.Kind == "ethernet" && item.Name != "en0" && item.Status == "active" {
+		if item.Name == route.Interface && item.ModuleID != "" && item.Kind == "ethernet" && item.Status == "active" {
 			return item.Name
 		}
 	}
 	for _, item := range interfaces {
-		if item.Kind == "ethernet" && item.Name != "en0" && item.Status == "active" {
+		if item.ModuleID != "" && item.Kind == "ethernet" && item.Status == "active" {
 			return item.Name
 		}
 	}
 	return ""
+}
+
+// Read the registry tree so an interface is attributed to its physical USB
+// ancestor rather than inferred from its name, IP address, or route priority.
+type registryPlistElement struct {
+	XMLName  xml.Name
+	Text     string                 `xml:",chardata"`
+	Children []registryPlistElement `xml:",any"`
+}
+
+func discoverModuleNetworkIdentities() map[string]string {
+	out, err := exec.Command("ioreg", "-a", "-l", "-r", "-c", "IOUSBHostDevice").Output()
+	if err != nil {
+		return nil
+	}
+	identities, err := parseModuleNetworkIdentities(out)
+	if err != nil {
+		return nil
+	}
+	return identities
+}
+
+func parseModuleNetworkIdentities(data []byte) (map[string]string, error) {
+	var root registryPlistElement
+	if err := xml.Unmarshal(data, &root); err != nil {
+		return nil, err
+	}
+	identities := make(map[string]string)
+	var visit func(registryPlistElement, string)
+	visit = func(element registryPlistElement, moduleID string) {
+		if element.XMLName.Local != "dict" {
+			for _, child := range element.Children {
+				visit(child, moduleID)
+			}
+			return
+		}
+		properties := make(map[string]registryPlistElement)
+		for i := 0; i+1 < len(element.Children); i += 2 {
+			if element.Children[i].XMLName.Local == "key" {
+				properties[element.Children[i].Text] = element.Children[i+1]
+			}
+		}
+		if properties["IOObjectClass"].Text == "IOUSBHostDevice" {
+			moduleID = ""
+			if properties["idVendor"].Text == "11427" && properties["idProduct"].Text == "16390" {
+				moduleID = properties["IORegistryEntryID"].Text
+			}
+		}
+		if name := properties["BSD Name"].Text; name != "" && moduleID != "" {
+			identities[name] = moduleID
+		}
+		visitChildren, ok := properties["IORegistryEntryChildren"]
+		if ok {
+			visit(visitChildren, moduleID)
+		}
+	}
+	visit(root, "")
+	return identities, nil
 }
 
 func discoverMacInterfaceCounters() (map[string]networkByteCounters, error) {
