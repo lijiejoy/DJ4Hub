@@ -229,6 +229,16 @@ func (a *ATBackend) ExecuteUSSD(ctx context.Context, command string, timeout tim
 	return modemUSSDResult(result), nil
 }
 
+// ContinueUSSD 回复正在进行的 USSD 会话（AT+CUSD=1,"<reply>",15）。
+// MBIM 后端早已有此方法；AT 后端补上后三路后端都满足 USSDContinueProvider。
+func (a *ATBackend) ContinueUSSD(ctx context.Context, input string, timeout time.Duration) (*USSDResult, error) {
+	result, err := a.modem.ContinueUSSD(input, timeout)
+	if err != nil {
+		return nil, err
+	}
+	return modemUSSDResult(result), nil
+}
+
 func (a *ATBackend) CancelUSSD(ctx context.Context) error {
 	a.modem.CancelUSSD()
 	return nil

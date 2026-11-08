@@ -7,13 +7,14 @@ import (
 	"time"
 )
 
-type usbAT struct{}
+type usbAT struct{ modemCallEvents }
 
 func openDJIUSBAT() (*usbAT, error) {
 	return nil, errors.New("USB AT requires macOS cgo build with libusb")
 }
 
-func (u *usbAT) Close() {}
+func (u *usbAT) Close()              {}
+func (u *usbAT) Description() string { return "USB AT unavailable in this build" }
 
 func (u *usbAT) Command(_ string, _ time.Duration) (string, error) {
 	return "", errors.New("USB AT is unavailable in this build")
@@ -21,4 +22,12 @@ func (u *usbAT) Command(_ string, _ time.Duration) (string, error) {
 
 func (u *usbAT) CommandWithPrompt(_ string, _ []byte, _ time.Duration) (string, error) {
 	return "", errors.New("USB AT is unavailable in this build")
+}
+
+func (u *usbAT) WaitForCUSD(_ time.Duration) (string, error) {
+	return "", errors.New("USB AT is unavailable in this build")
+}
+
+func (u *usbAT) RecentURCs() []string {
+	return nil
 }

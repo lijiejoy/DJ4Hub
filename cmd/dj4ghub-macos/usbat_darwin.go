@@ -24,12 +24,24 @@ const (
 )
 
 type usbAT struct {
+	modemCallEvents
 	ctx         *C.libusb_context
 	handle      *C.libusb_device_handle
 	iface       int
 	endpointIn  byte
 	endpointOut byte
 	mu          sync.Mutex
+	// urcs is the last few modem URC lines seen while draining the bulk
+	// interface between commands (NO CARRIER, BUSY, NO ANSWER, RING,
+	// +CLCC, +CMTI, +CDS, +CUSD, CME/CMS errors), oldest first, capped
+	// at 20, with a capture timestamp each (urcAt, parallel to urcs).
+	// The drain used to throw these away, so the service could never
+	// learn why the modem released a call; the SIP reconciler reads
+	// them back as the release reason. Guarded by urcMu, never taken
+	// while holding mu.
+	urcMu sync.Mutex
+	urcs  []string
+	urcAt []time.Time
 }
 
 type usbATCandidate struct {
@@ -188,6 +200,7 @@ func (u *usbAT) Command(cmd string, timeout time.Duration) (string, error) {
 		if len(data) == 0 {
 			continue
 		}
+		u.feedCallBytes(string(data))
 		chunks = append(chunks, string(data))
 		joined := strings.Join(chunks, "")
 		if atResponseComplete(joined) {
@@ -249,6 +262,7 @@ func (u *usbAT) CommandWithPrompt(cmd string, followUp []byte, timeout time.Dura
 		if len(data) == 0 {
 			continue
 		}
+		u.feedCallBytes(string(data))
 		response.Write(data)
 		joined := response.String()
 
@@ -281,14 +295,116 @@ func (u *usbAT) CommandWithPrompt(cmd string, followUp []byte, timeout time.Dura
 	return normalizeATResponse(response.String()), errors.New("USB interactive AT command timed out before completion")
 }
 
+// WaitForCUSD waits up to timeout for a "+CUSD:" URC line on the bulk
+// interface and returns the raw line. The USB-AT bridge has no background
+// URC reader, so a USSD wait must read the interface directly, holding the
+// bridge lock for the whole wait so no other command can drain the line in
+// between. Callers parse the line with modem.ParseCUSDLine.
+func (u *usbAT) WaitForCUSD(timeout time.Duration) (string, error) {
+	if u == nil {
+		return "", errors.New("USB AT device is not open")
+	}
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if u.handle == nil {
+		return "", errors.New("USB AT device is not open")
+	}
+	deadline := time.Now().Add(timeout)
+	var buf strings.Builder
+	for time.Now().Before(deadline) {
+		remaining := time.Until(deadline)
+		if remaining > 900*time.Millisecond {
+			remaining = 900 * time.Millisecond
+		}
+		data, err := u.bulkReadLocked(u.endpointIn, remaining)
+		if err != nil {
+			if errors.Is(err, errUSBTimeout) {
+				continue
+			}
+			return "", err
+		}
+		if len(data) == 0 {
+			continue
+		}
+		u.feedCallBytes(string(data))
+		buf.Write(data)
+		for _, line := range strings.Split(buf.String(), "\n") {
+			if idx := strings.Index(line, "+CUSD:"); idx >= 0 {
+				return strings.TrimSpace(line[idx:]), nil
+			}
+		}
+	}
+	return "", errors.New("timed out waiting for +CUSD response")
+}
+
 var errUSBTimeout = errors.New("usb timeout")
 
 func (u *usbAT) drainLocked() {
 	for {
-		if _, err := u.bulkReadLocked(u.endpointIn, 80*time.Millisecond); err != nil {
+		data, err := u.bulkReadLocked(u.endpointIn, 80*time.Millisecond)
+		if err != nil {
 			return
 		}
+		u.stashURCs(string(data))
+		u.feedCallBytes(string(data))
 	}
+}
+
+// stashURCs keeps modem URC lines from a drained chunk, oldest first,
+// capped at 20. Anything else (echoes, OK, signal reports) is dropped.
+func (u *usbAT) stashURCs(chunk string) {
+	for _, line := range strings.Split(chunk, "\n") {
+		line = strings.TrimSpace(strings.Trim(line, "\r"))
+		if line == "" {
+			continue
+		}
+		upper := strings.ToUpper(line)
+		if !(strings.Contains(upper, "NO CARRIER") || strings.Contains(upper, "BUSY") ||
+			strings.Contains(upper, "NO ANSWER") || strings.Contains(upper, "NO DIALTONE") ||
+			strings.HasPrefix(upper, "RING") || strings.HasPrefix(upper, "+CLCC:") ||
+			strings.HasPrefix(upper, "+CMTI:") || strings.HasPrefix(upper, "+CDS:") ||
+			strings.HasPrefix(upper, "+CUSD:") || strings.Contains(upper, "CME ERROR") ||
+			strings.Contains(upper, "CMS ERROR")) {
+			continue
+		}
+		now := time.Now()
+		u.urcMu.Lock()
+		u.urcs = append(u.urcs, now.Format("15:04:05")+" "+line)
+		u.urcAt = append(u.urcAt, now)
+		if len(u.urcs) > 20 {
+			u.urcs = append([]string{}, u.urcs[len(u.urcs)-20:]...)
+			u.urcAt = append([]time.Time{}, u.urcAt[len(u.urcAt)-20:]...)
+		}
+		u.urcMu.Unlock()
+	}
+}
+
+// urcFreshness is how long a captured URC stays attributable to a call.
+// A genuine release URC is read by the reconciler within ~10s of being
+// captured (polls run every ~5s while a call is live); an older one
+// belongs to a previous call and must never fail a fresh dial.
+const urcFreshness = 30 * time.Second
+
+// RecentURCs returns the captured URC lines from the last 30 seconds,
+// oldest first. Older lines are dropped: they describe a previous call,
+// not the live one.
+func (u *usbAT) RecentURCs() []string {
+	if u == nil {
+		return nil
+	}
+	u.urcMu.Lock()
+	defer u.urcMu.Unlock()
+	cutoff := time.Now().Add(-urcFreshness)
+	var out []string
+	for i, line := range u.urcs {
+		if i < len(u.urcAt) && u.urcAt[i].After(cutoff) {
+			out = append(out, line)
+		}
+	}
+	return out
 }
 
 func (u *usbAT) Description() string {
@@ -308,7 +424,7 @@ func (u *usbAT) bulkWriteLocked(endpoint byte, payload []byte, timeout time.Dura
 		(*C.uchar)(ptr),
 		C.int(len(payload)),
 		&transferred,
-		C.uint(timeout.Milliseconds()),
+		C.uint(boundedTimeoutMillis(timeout)),
 	)
 	if rc != 0 {
 		return fmt.Errorf("USB bulk write: %s", usbErrorName(rc))
@@ -328,7 +444,7 @@ func (u *usbAT) bulkReadLocked(endpoint byte, timeout time.Duration) ([]byte, er
 		(*C.uchar)(unsafe.Pointer(&buf[0])),
 		C.int(len(buf)),
 		&transferred,
-		C.uint(timeout.Milliseconds()),
+		C.uint(boundedTimeoutMillis(timeout)),
 	)
 	if rc == C.LIBUSB_ERROR_TIMEOUT {
 		return nil, errUSBTimeout
@@ -339,48 +455,17 @@ func (u *usbAT) bulkReadLocked(endpoint byte, timeout time.Duration) ([]byte, er
 	return buf[:int(transferred)], nil
 }
 
+// libusb treats a zero timeout as "wait forever" (an infinite transfer), so
+// sub-millisecond durations must be rounded up rather than truncated to 0.
+// Without this the AT bridge can block forever inside libusb_bulk_transfer.
+func boundedTimeoutMillis(timeout time.Duration) int64 {
+	ms := timeout.Milliseconds()
+	if ms <= 0 {
+		return 1
+	}
+	return ms
+}
+
 func usbErrorName(rc C.int) string {
 	return C.GoString(C.libusb_error_name(rc))
-}
-
-func atResponseComplete(resp string) bool {
-	normalized := strings.ReplaceAll(resp, "\r\n", "\n")
-	return strings.Contains(normalized, "\nOK\n") ||
-		strings.HasSuffix(normalized, "\nOK") ||
-		atResponseIsError(normalized)
-}
-
-func atResponseIsError(resp string) bool {
-	normalized := strings.ToUpper(strings.ReplaceAll(resp, "\r\n", "\n"))
-	return strings.Contains(normalized, "\nERROR\n") ||
-		strings.HasSuffix(normalized, "\nERROR") ||
-		strings.Contains(normalized, "+CME ERROR:") ||
-		strings.Contains(normalized, "+CMS ERROR:")
-}
-
-func atResponseHasPrompt(resp string) bool {
-	trimmed := strings.TrimRight(resp, " \t\r\n")
-	return strings.HasSuffix(trimmed, ">")
-}
-
-// A probe must receive OK. ERROR merely proves that a bulk interface accepted
-// bytes; it is not the modem's AT channel (the QMI interface can do that).
-func atProbeSucceeded(resp string) bool {
-	normalized := strings.ReplaceAll(strings.TrimSpace(resp), "\r\n", "\n")
-	return normalized == "OK" || strings.HasSuffix(normalized, "\nOK")
-}
-
-func normalizeATResponse(resp string) string {
-	resp = strings.ReplaceAll(resp, "\r\r\n", "\r\n")
-	resp = strings.TrimSpace(resp)
-	lines := strings.Split(resp, "\n")
-	filtered := lines[:0]
-	for _, line := range lines {
-		line = strings.TrimRight(line, "\r")
-		if strings.TrimSpace(line) == "" {
-			continue
-		}
-		filtered = append(filtered, line)
-	}
-	return strings.Join(filtered, "\r\n")
 }

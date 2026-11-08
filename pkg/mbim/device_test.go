@@ -264,6 +264,7 @@ type readErrorTransport struct {
 	mu      sync.Mutex
 	written [][]byte
 	toRead  chan readResult
+	reply   func([]byte) (readResult, bool)
 }
 
 type readResult struct {
@@ -280,6 +281,11 @@ func (t *readErrorTransport) WriteMessage(b []byte) error {
 	t.mu.Lock()
 	t.written = append(t.written, cp)
 	t.mu.Unlock()
+	if t.reply != nil {
+		if result, ok := t.reply(cp); ok {
+			t.toRead <- result
+		}
+	}
 	return nil
 }
 
@@ -294,17 +300,28 @@ func (t *readErrorTransport) Close() error {
 
 func TestDeviceReadErrorFailsPendingCommand(t *testing.T) {
 	tr := newReadErrorTransport()
-	tr.toRead <- readResult{msg: openDoneMsg(1)}
+	readErr := errors.New("read failed")
+	tr.reply = func(written []byte) (readResult, bool) {
+		header, _ := decodeHeader(written)
+		switch header.Type {
+		case MessageTypeOpen:
+			return readResult{msg: openDoneMsg(header.TransactionID)}, true
+		case MessageTypeCommand:
+			return readResult{err: readErr}, true
+		}
+		return readResult{}, false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
 	d := newDevice(tr)
-	if err := d.Open(context.Background(), 4096); err != nil {
+	defer d.Close()
+	if err := d.Open(ctx, 4096); err != nil {
 		t.Fatalf("Open: %v", err)
 	}
 
-	readErr := errors.New("read failed")
-	tr.toRead <- readResult{err: readErr}
-	_, err := d.Command(context.Background(), UUIDBasicConnect, CIDBasicConnectDeviceCaps, CommandTypeQuery, nil)
-	if err == nil {
-		t.Fatal("Command should fail when read loop fails")
+	_, err := d.Command(ctx, UUIDBasicConnect, CIDBasicConnectDeviceCaps, CommandTypeQuery, nil)
+	if !errors.Is(err, readErr) {
+		t.Fatalf("Command should return the read failure, got %v", err)
 	}
 }
 

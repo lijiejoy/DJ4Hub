@@ -19,7 +19,7 @@ func (a *app) communicationAlerts(w http.ResponseWriter, r *http.Request) {
 	}
 	a.smsMu.RUnlock()
 	ringing := []string{}
-	if h := a.historyStore(); h != nil {
+	if h := a.communicationHistoryStore(); h != nil {
 		h.mu.Lock()
 		for _, record := range h.records {
 			if record.Kind == "call" && record.Direction == "incoming" && record.State == "observed" && record.Ended == nil {

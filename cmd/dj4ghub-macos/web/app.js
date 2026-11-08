@@ -333,6 +333,113 @@ async function loadStatus() {
   }
 }
 
+
+// --- Subscription identity & number (delivery point 5) -------------------
+// 本机号码只在启动、手动刷新或换卡时读取，不跟随 10 秒状态轮询，避免
+// 对模块增加 AT 压力。备注号码明确标注为用户备注，不显示为运营商已验证。
+let lastSubscription = null;
+let subscriptionNumberRevealed = false;
+
+function renderSubscription(data) {
+  lastSubscription = data;
+  const number = data.number || "";
+  const shown = !number ? "--" : (subscriptionNumberRevealed ? number : maskPhoneNumber(number));
+  setValue("#subscription-number", shown, number ? "neutral" : "muted");
+  setValue("#subscription-number-source", data.number_label || data.number_source || "--", data.number_source === "remark" ? "warn" : "neutral");
+  setValue("#subscription-id", data.subscription_id || "--", "neutral");
+  setValue("#subscription-iccid", data.iccid_masked || "--", "neutral");
+  const source = $("#subscription-source");
+  source.textContent = data.stale
+    ? "号码可能过期：上次刷新失败，显示的是旧读数"
+    : (data.number_source === "auto" ? "号码由 SIM 自动读取（AT+CNUM）"
+      : data.number_source === "remark" ? "当前显示的是用户备注号码，未经运营商验证"
+      : "未读到号码：可手动备注，或检查 SIM 卡");
+  const remark = $("#subscription-remark");
+  if (document.activeElement !== remark) remark.value = "";
+}
+
+async function loadSubscription() {
+  try {
+    renderSubscription(await api("/api/subscription"));
+  } catch (error) {
+    $("#subscription-source").textContent = `号码未读取：${error.message}`;
+  }
+}
+
+async function saveSubscriptionRemark(number) {
+  const saved = await api("/api/subscription/remark", { method: "POST", body: JSON.stringify({ number }) });
+  renderSubscription(saved);
+  notice(number ? "备注号码已保存" : "备注已清除");
+}
+
+$("#subscription-number").addEventListener("click", () => {
+  if (!lastSubscription || !lastSubscription.number) return;
+  subscriptionNumberRevealed = !subscriptionNumberRevealed;
+  renderSubscription(lastSubscription);
+});
+
+$("#refresh-subscription").addEventListener("click", async (event) => {
+  const button = event.currentTarget;
+  button.disabled = true;
+  try {
+    renderSubscription(await api("/api/subscription/refresh", { method: "POST" }));
+  } catch (error) {
+    notice(error.message);
+  } finally {
+    button.disabled = false;
+  }
+});
+
+$("#subscription-remark-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  try {
+    await saveSubscriptionRemark($("#subscription-remark").value);
+  } catch (error) {
+    notice(error.message);
+  }
+});
+
+$("#subscription-remark-clear").addEventListener("click", async () => {
+  try {
+    await saveSubscriptionRemark("");
+  } catch (error) {
+    notice(error.message);
+  }
+});
+
+// --- Init diagnostics (delivery point 5) ---------------------------------
+// 只报告结果与建议，不执行任何修复动作；通话期间修复一律视为被阻塞。
+async function runInitDiagnostics(button) {
+  button.disabled = true;
+  try {
+    const result = await api("/api/diagnostics/init");
+    const summary = $("#diagnostics-summary");
+    summary.textContent = result.summary === "ok"
+      ? "全部通过：未发现需要恢复的问题"
+      : result.summary === "attention" ? "有待观察项，见下方建议"
+      : result.summary === "error" ? "发现需要处理的问题，见下方建议"
+      : "部分项目未确认";
+    if (result.call_active) summary.textContent += "（通话进行中，修复动作已阻塞）";
+    const list = $("#diagnostics-list");
+    list.classList.remove("empty");
+    list.replaceChildren(...result.checks.map((check) => diagnosticCard(
+      `${check.label} · ${check.status === "pass" ? "通过" : check.status === "warn" ? "待观察" : check.status === "fail" ? "失败" : "未确认"}`,
+      check.detail,
+      check.suggestion || "",
+    )));
+    const note = document.createElement("p");
+    note.className = "inline-status";
+    note.textContent = result.note || "";
+    list.append(note);
+  } catch (error) {
+    $("#diagnostics-summary").textContent = `诊断失败：${error.message}`;
+  } finally {
+    button.disabled = false;
+  }
+}
+
+$("#run-diagnostics").addEventListener("click", (event) => void runInitDiagnostics(event.currentTarget));
+
 async function loadSMS() {
   const list = $("#sms-list");
   try {
@@ -1344,6 +1451,683 @@ async function loadESIM() {
   }
 }
 
+let sipTimer = null;
+let sipSettingsLoaded = false;
+let sipInFlight = false;
+let alertCall = null;
+let callActionPending = false;
+let callMuted = false;
+let callAudio = null;
+let callRingTimer = null;
+let callNotification = null;
+let callRestoreFocus = null;
+let nativeAlertCallID = "";
+let sipActiveCallId = null;
+let sipMicMuted = false;
+let sipSpeakerMuted = false;
+let sipMuteCallId = null;
+let sipAudioDevicesLoaded = false;
+const callToneNodes = new Set();
+const notifiedCalls = new Set();
+const normalPageTitle = document.title;
+
+async function unlockCallAudio() {
+  const Audio = window.AudioContext || window.webkitAudioContext;
+  if (!Audio) return;
+  if (!callAudio) callAudio = new Audio();
+  if (callAudio.state === "suspended") await callAudio.resume();
+}
+
+// Browsers require a user gesture before playing audio.
+document.addEventListener("pointerdown", () => { void unlockCallAudio().catch(() => {}); }, { once: true });
+document.addEventListener("keydown", () => { void unlockCallAudio().catch(() => {}); }, { once: true });
+
+function playCallRing() {
+  if (!alertCall || alertCall.state !== "ringing" || nativeAlertCallID === alertCall.id || callMuted || callAudio?.state !== "running") return;
+  for (const offset of [0, 0.45]) {
+    const at = callAudio.currentTime + offset;
+    const gain = callAudio.createGain();
+    gain.gain.setValueAtTime(0, at);
+    gain.gain.linearRampToValueAtTime(0.09, at + 0.02);
+    gain.gain.setValueAtTime(0.09, at + 0.22);
+    gain.gain.linearRampToValueAtTime(0, at + 0.26);
+    gain.connect(callAudio.destination);
+    let remaining = 2;
+    for (const frequency of [440, 480]) {
+      const tone = callAudio.createOscillator();
+      tone.frequency.value = frequency;
+      tone.connect(gain);
+      callToneNodes.add(tone);
+      tone.onended = () => {
+        tone.disconnect();
+        callToneNodes.delete(tone);
+        if (--remaining === 0) gain.disconnect();
+      };
+      tone.start(at);
+      tone.stop(at + 0.28);
+    }
+  }
+}
+
+function stopCallRing() {
+  clearInterval(callRingTimer);
+  callRingTimer = null;
+  for (const tone of callToneNodes) {
+    try { tone.stop(); } catch (_) {}
+    tone.disconnect();
+  }
+  callToneNodes.clear();
+  callNotification?.close();
+  callNotification = null;
+  document.title = normalPageTitle;
+}
+
+function updateIncomingCall(status) {
+  if ("native_alert_call_id" in status) nativeAlertCallID = status.native_alert_call_id;
+  const dialog = $("#incoming-call");
+  const call = (status.calls || []).find((c) => c.direction === "inbound" && c.state === "ringing")
+    || (status.calls || []).find((c) => c.direction === "inbound" && c.state === "active");
+  if (!call) {
+    stopCallRing();
+    alertCall = null;
+    if (dialog.open) {
+      dialog.close();
+      if (callRestoreFocus?.isConnected) callRestoreFocus.focus();
+    }
+    return;
+  }
+  if (alertCall?.id !== call.id) {
+    stopCallRing();
+    callMuted = false;
+    $("#incoming-call-error").hidden = true;
+    callRestoreFocus = document.activeElement;
+  }
+  alertCall = call;
+  dialog.dataset.state = call.state;
+  $("#incoming-call-number").textContent = call.number && call.number !== "unknown" ? call.number : "未知号码";
+  $("#incoming-call-title").textContent = call.state === "ringing" ? "电话来电" : "语音通话";
+  $("#incoming-call-state").textContent = call.state === "ringing"
+    ? "邀请你进行语音通话"
+    : status.audio?.local?.state === "running" || !call.local_audio ? "通话中" : "正在连接声音…";
+  $("#incoming-call-answer").hidden = call.state !== "ringing";
+  $("#incoming-call-answer").disabled = callActionPending;
+  $("#incoming-call-reject").disabled = callActionPending;
+  $("#incoming-call-reject span").textContent = call.state === "ringing" ? "拒接" : "挂断";
+  $("#incoming-call-reject").setAttribute("aria-label", call.state === "ringing" ? "拒接来电" : "挂断通话");
+  const nativeRinging = nativeAlertCallID === call.id;
+  $("#incoming-call-mute").hidden = call.state !== "ringing" || nativeRinging;
+  const muteLabel = callMuted ? "取消静音" : callAudio?.state === "running" ? "静音铃声" : "开启铃声";
+  $("#incoming-call-mute").textContent = muteLabel;
+  $("#incoming-call-mute").setAttribute("aria-label", muteLabel);
+  if (!dialog.open) {
+    dialog.showModal();
+    (call.state === "ringing" ? $("#incoming-call-answer") : $("#incoming-call-reject")).focus();
+  }
+  if (call.state !== "ringing") {
+    stopCallRing();
+    return;
+  }
+  if (nativeRinging) {
+    stopCallRing();
+    document.title = `来电：${$("#incoming-call-number").textContent} · ${normalPageTitle}`;
+    return;
+  }
+  if (!callRingTimer) {
+    playCallRing();
+    callRingTimer = setInterval(playCallRing, 1800);
+  }
+  document.title = `来电：${$("#incoming-call-number").textContent} · ${normalPageTitle}`;
+  if (document.hidden && "Notification" in window && Notification.permission === "granted" && !notifiedCalls.has(call.id)) {
+    notifiedCalls.add(call.id);
+    if (notifiedCalls.size > 40) notifiedCalls.delete(notifiedCalls.values().next().value);
+    callNotification = new Notification("DJ 4G Hub · 电话来电", {
+      body: $("#incoming-call-number").textContent, tag: `call-${call.id}`, requireInteraction: true,
+    });
+    callNotification.onclick = () => { window.focus(); $("#incoming-call-answer").focus(); };
+  }
+}
+
+$("#incoming-call").addEventListener("cancel", (event) => {
+  event.preventDefault();
+  $("#incoming-call-mute").click();
+});
+$("#incoming-call-mute").addEventListener("click", async () => {
+  await unlockCallAudio().catch(() => {});
+  callMuted = !callMuted;
+  if (callAudio?.state === "running" && $("#incoming-call-mute").textContent === "开启铃声") callMuted = false;
+  if (callMuted) {
+    for (const tone of callToneNodes) { try { tone.stop(); } catch (_) {} }
+  } else playCallRing();
+  if (alertCall) updateIncomingCall({ calls: [alertCall] });
+});
+$("#call-alerts-enable").addEventListener("click", async () => {
+  await unlockCallAudio().catch(() => {});
+  if ("Notification" in window && Notification.permission === "default") await Notification.requestPermission();
+  $("#call-alerts-enable").textContent = "来电提醒已开启";
+  notice("Notification" in window && Notification.permission === "granted" ? "铃声和系统来电提醒已开启" : "页面来电弹窗和铃声已开启");
+});
+async function handleIncomingCallAction(action) {
+  if (!alertCall || callActionPending) return;
+  const id = alertCall.id;
+  callActionPending = true;
+  $("#incoming-call-answer").disabled = true;
+  $("#incoming-call-reject").disabled = true;
+  $("#incoming-call-error").hidden = true;
+  try {
+    await api(`/api/sip/${action}`, { method: "POST", body: JSON.stringify({ call_id: id }) });
+    stopCallRing();
+    $("#incoming-call-state").textContent = action === "answer" ? "正在连接声音…" : "正在挂断…";
+  } catch (error) {
+    $("#incoming-call-error").textContent = error.message;
+    $("#incoming-call-error").hidden = false;
+  } finally {
+    callActionPending = false;
+    await loadSIP();
+  }
+}
+$("#incoming-call-answer").addEventListener("click", () => void handleIncomingCallAction("answer"));
+$("#incoming-call-reject").addEventListener("click", () => void handleIncomingCallAction("hangup"));
+
+function sipStateLabel(state) {
+  return { dialing: "拨号中", ringing: "振铃中", active: "通话中", ended: "已结束", failed: "失败", missed: "未接" }[state] || state;
+}
+
+// End reason labels mirror sip.EndReasonLabel; "unknown" is intentionally
+// not shown — an undistinguished cause is reported as nothing, not a guess.
+function sipEndReasonLabel(reason) {
+  return {
+    local_hangup: "本机挂断", remote_hangup: "对方挂断", local_reject: "主动拒接",
+    remote_cancel: "对方取消", no_answer: "未接超时", no_network: "无网络",
+    busy: "忙线", media_failed: "媒体失败", device_disconnected: "设备断开",
+    local_cancel: "本机取消",
+  }[reason] || "";
+}
+
+function formatCallDuration(seconds) {
+  const total = Math.max(0, Math.floor(seconds || 0));
+  const minutes = Math.floor(total / 60);
+  return `${String(minutes).padStart(2, "0")}:${String(total % 60).padStart(2, "0")}`;
+}
+
+function sipCallFlags(call) {
+  const flags = [];
+  if (call.module_connected) flags.push("模块已接通");
+  if (call.media_ready) flags.push("媒体就绪");
+  return flags.length ? ` · ${flags.join(" · ")}` : "";
+}
+
+async function loadSIP() {
+  if (sipInFlight) return;
+  sipInFlight = true;
+  const statusLine = $("#sip-status-line");
+  try {
+    const status = await api("/api/sip/status");
+    updateIncomingCall(status);
+    $("#sip-listen-state").textContent = status.listening ? "监听中" : "未监听";
+    const audio = status.audio || {};
+    statusLine.textContent = status.listening
+      ? `SIP ${status.listen_addr} · realm ${status.realm} · 用户 ${status.username} · 音频：${audio.detail || "未知"}`
+      : `SIP 未监听：${status.listen_error || "已停用"}`;
+    const calls = (status.calls || []).slice().sort((a, b) => new Date(a.started_at) - new Date(b.started_at));
+    const callsList = $("#sip-calls-list");
+    const callsStatus = $("#sip-calls-status");
+    if (calls.length === 0) {
+      callsList.textContent = "暂无通话";
+      callsList.classList.add("empty");
+      callsStatus.textContent = "暂无通话";
+    } else {
+      callsList.classList.remove("empty");
+      callsList.innerHTML = "";
+      const latest = calls[calls.length - 1];
+      callsStatus.textContent = `最近：${latest.direction === "inbound" ? "来电" : "去电"} ${latest.number} · ${sipStateLabel(latest.state)}`;
+      $("#sip-call-status").textContent = ["dialing", "ringing", "active"].includes(latest.state)
+        ? `${latest.direction === "inbound" ? "来电" : "去电"} ${latest.number} · ${sipStateLabel(latest.state)}`
+        : "未通话";
+      for (const call of calls.slice().reverse()) {
+        const item = document.createElement("div");
+        item.className = "item";
+        const rtp = call.rtp ? ` · RTP ${call.rtp.local_port} 收 ${call.rtp.rx_packets} 发 ${call.rtp.tx_packets}` : "";
+        const reason = sipEndReasonLabel(call.end_reason);
+        const reasonText = reason ? ` · ${reason}` : "";
+        const durationText = call.duration_seconds ? ` · ${formatCallDuration(call.duration_seconds)}` : "";
+        item.textContent = `${call.direction === "inbound" ? "来电" : "去电"} ${call.number} · ${sipStateLabel(call.state)}${reasonText}${durationText}${sipCallFlags(call)}${call.error ? " · " + call.error : ""}${rtp}`;
+        callsList.appendChild(item);
+      }
+      updateInCallPanel(calls);
+    }
+    const regs = status.registrations || [];
+    const regList = $("#sip-reg-list");
+    if (regs.length === 0) {
+      regList.textContent = "无注册客户端";
+      regList.classList.add("empty");
+      $("#sip-reg-status").textContent = "无注册";
+    } else {
+      regList.classList.remove("empty");
+      regList.innerHTML = "";
+      $("#sip-reg-status").textContent = `${regs.length} 个客户端已注册`;
+      for (const reg of regs) {
+        const item = document.createElement("div");
+        item.className = "item";
+        item.textContent = `${reg.username} · ${reg.contact} · ${reg.source}`;
+        regList.appendChild(item);
+      }
+    }
+    if (!sipSettingsLoaded) {
+      sipSettingsLoaded = true;
+      try {
+        const settings = await api("/api/sip/settings");
+        $("#sip-enabled").value = String(settings.enabled);
+        $("#sip-listen").value = settings.listen || "";
+        $("#sip-realm").value = settings.realm || "";
+        $("#sip-username").value = settings.username || "";
+        $("#sip-rtp-min").value = settings.rtp_min || "";
+        $("#sip-rtp-max").value = settings.rtp_max || "";
+      } catch (_) {}
+    }
+  } catch (error) {
+    statusLine.textContent = `SIP 状态读取失败：${error.message}`;
+    if (alertCall) {
+      stopCallRing();
+      $("#incoming-call-state").textContent = "连接中断，正在重试…";
+      $("#incoming-call-answer").disabled = true;
+      $("#incoming-call-reject").disabled = true;
+    }
+  } finally {
+    sipInFlight = false;
+  }
+}
+
+// In-call panel: DTMF keypad and mic/speaker mute for the live call.
+// Mute is per-call on the server, so switching calls resets the toggles.
+function updateInCallPanel(calls) {
+  const panel = $("#sip-in-call-panel");
+  const live = [...calls].reverse().find((c) => ["dialing", "ringing", "active"].includes(c.state)) || null;
+  sipActiveCallId = live ? live.id : null;
+  panel.hidden = !live;
+  if (!live) return;
+  if (sipMuteCallId !== live.id) {
+    sipMuteCallId = live.id;
+    sipMicMuted = false;
+    sipSpeakerMuted = false;
+  }
+  const stateLine = `${sipStateLabel(live.state)}${live.duration_seconds ? ` · ${formatCallDuration(live.duration_seconds)}` : ""}${sipCallFlags(live)}`;
+  $("#sip-in-call-state").textContent = stateLine;
+  const canControl = live.state === "active" && live.local_audio;
+  $("#sip-mic-mute").disabled = !canControl;
+  $("#sip-speaker-mute").disabled = !canControl;
+  $("#sip-mic-mute").textContent = sipMicMuted ? "取消麦克风静音" : "麦克风静音";
+  $("#sip-speaker-mute").textContent = sipSpeakerMuted ? "取消扬声器静音" : "扬声器静音";
+  const canDtmf = live.state === "active";
+  document.querySelectorAll("#sip-dtmf-pad button").forEach((button) => { button.disabled = !canDtmf; });
+}
+
+async function sendSipAudioControls() {
+  if (!sipActiveCallId) return;
+  try {
+    await api("/api/sip/audio-controls", {
+      method: "POST",
+      body: JSON.stringify({ call_id: sipActiveCallId, microphone_muted: sipMicMuted, speaker_muted: sipSpeakerMuted }),
+    });
+    $("#sip-in-call-status").textContent = "";
+  } catch (error) {
+    $("#sip-in-call-status").textContent = `静音设置失败：${error.message}`;
+  }
+}
+
+$("#sip-mic-mute").addEventListener("click", () => {
+  sipMicMuted = !sipMicMuted;
+  $("#sip-mic-mute").textContent = sipMicMuted ? "取消麦克风静音" : "麦克风静音";
+  void sendSipAudioControls();
+});
+
+$("#sip-speaker-mute").addEventListener("click", () => {
+  sipSpeakerMuted = !sipSpeakerMuted;
+  $("#sip-speaker-mute").textContent = sipSpeakerMuted ? "取消扬声器静音" : "扬声器静音";
+  void sendSipAudioControls();
+});
+
+$("#sip-dtmf-pad").addEventListener("click", async (event) => {
+  const button = event.target.closest("button[data-digit]");
+  if (!button || button.disabled || !sipActiveCallId) return;
+  const digit = button.dataset.digit;
+  try {
+    await api("/api/sip/dtmf", { method: "POST", body: JSON.stringify({ call_id: sipActiveCallId, digit }) });
+    $("#sip-in-call-status").textContent = `已发送按键 ${digit}`;
+  } catch (error) {
+    $("#sip-in-call-status").textContent = `按键发送失败：${error.message}`;
+  }
+});
+
+function fillSipAudioSelect(select, devices, wantInput, selected) {
+  select.innerHTML = "";
+  const fallback = document.createElement("option");
+  fallback.value = "";
+  fallback.textContent = "系统默认（内置）";
+  select.appendChild(fallback);
+  for (const device of devices) {
+    if (wantInput && !device.has_input) continue;
+    if (!wantInput && !device.has_output) continue;
+    const option = document.createElement("option");
+    option.value = device.uid;
+    option.textContent = device.name;
+    if (device.uid === selected || device.name === selected) option.selected = true;
+    select.appendChild(option);
+  }
+  if (selected && ![...select.options].some((o) => o.selected && o.value)) {
+    // Stored selection is no longer listed (device unplugged): keep it
+    // visible instead of silently falling back to another device.
+    const option = document.createElement("option");
+    option.value = selected;
+    option.textContent = `${selected}（设备不在列表中）`;
+    option.selected = true;
+    select.appendChild(option);
+  }
+}
+
+async function loadSipAudioDevices() {
+  if (sipAudioDevicesLoaded) return;
+  try {
+    const data = await api("/api/sip/audio-devices");
+    fillSipAudioSelect($("#sip-audio-input"), data.devices || [], true, data.input || "");
+    fillSipAudioSelect($("#sip-audio-output"), data.devices || [], false, data.output || "");
+    sipAudioDevicesLoaded = true;
+    $("#sip-audio-devices-status").textContent = "";
+  } catch (error) {
+    $("#sip-audio-devices-status").textContent = `音频设备读取失败：${error.message}`;
+  }
+}
+
+$("#sip-audio-devices-save").addEventListener("click", async () => {
+  const status = $("#sip-audio-devices-status");
+  status.textContent = "正在保存…";
+  try {
+    await api("/api/sip/audio-devices", {
+      method: "POST",
+      body: JSON.stringify({ input: $("#sip-audio-input").value, output: $("#sip-audio-output").value }),
+    });
+    status.textContent = "音频设备已保存，下次通话生效";
+    notice("音频设备已保存，下次通话生效");
+  } catch (error) {
+    status.textContent = `保存失败：${error.message}`;
+  }
+});
+
+function setSIPPolling() {
+  if (sipTimer) return;
+  void loadSIP();
+  sipTimer = setInterval(() => void loadSIP(), 1000);
+}
+
+$("#sip-call-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const input = $("#sip-number");
+  const number = input.value.trim();
+  if (!number) return;
+  const status = $("#sip-call-status");
+  status.textContent = `正在拨打 ${number}…`;
+  try {
+    await api("/api/sip/call", { method: "POST", body: JSON.stringify({ number }) });
+    notice(`已发起呼叫：${number}`);
+    await loadSIP();
+  } catch (error) {
+    status.textContent = `拨打失败：${error.message}`;
+    notice(error.message);
+  }
+});
+
+$("#sip-hangup").addEventListener("click", async () => {
+  try {
+    await api("/api/sip/hangup", { method: "POST", body: JSON.stringify({}) });
+    notice("已挂断");
+    await loadSIP();
+  } catch (error) {
+    notice(error.message);
+  }
+});
+
+$("#sip-answer").addEventListener("click", async () => {
+  try {
+    await api("/api/sip/answer", { method: "POST", body: JSON.stringify({}) });
+    notice("已接听");
+    await loadSIP();
+  } catch (error) {
+    notice(error.message);
+  }
+});
+
+$("#refresh-sip").addEventListener("click", loadSIP);
+
+$("#sip-settings-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const status = $("#sip-settings-status");
+  status.textContent = "正在保存…";
+  const body = {
+    enabled: $("#sip-enabled").value === "true",
+    listen: $("#sip-listen").value.trim(),
+    realm: $("#sip-realm").value.trim(),
+    username: $("#sip-username").value.trim(),
+    rtp_min: Number($("#sip-rtp-min").value) || undefined,
+    rtp_max: Number($("#sip-rtp-max").value) || undefined,
+  };
+  const password = $("#sip-password").value;
+  if (password) body.password = password;
+  try {
+    await api("/api/sip/settings", { method: "POST", body: JSON.stringify(body) });
+    status.textContent = "SIP 设置已保存";
+    $("#sip-password").value = "";
+    notice("SIP 设置已保存");
+    await loadSIP();
+  } catch (error) {
+    status.textContent = `保存失败：${error.message}`;
+    notice(error.message);
+  }
+});
+
+/* delivery-3: 最近通话（持久化历史）——列表复用 GET /api/history/calls；
+   回拨走 POST /api/calls/redial（内部转调原有 /api/sip/call），
+   发短信走 POST /api/calls/sms（内部转调原有 /api/sms/send），
+   保存联系人走 POST /api/calls/save-contact；未接角标来自
+   GET /api/calls/missed-count，列表成功渲染后调
+   POST /api/calls/missed/seen 清零。 */
+let recentCallsState = { scope: "all", direction: "", subscription: "", offset: 0, total: 0, loading: false };
+let recentContactsByNormalized = new Map();
+
+async function loadRecentContacts() {
+  try {
+    const data = await api("/api/contacts");
+    recentContactsByNormalized = new Map();
+    for (const contact of data.items || []) {
+      for (const normalized of contact.normalized || []) recentContactsByNormalized.set(normalized, contact);
+    }
+  } catch (error) {
+    // 联系人名解析失败不阻塞通话列表，只显示原始号码。
+  }
+}
+
+function recentCallContactName(call) {
+  const contact = recentContactsByNormalized.get(call.number_normalized || "");
+  return contact ? contact.name : "";
+}
+
+async function refreshMissedBadge() {
+  const badge = $("#calls-missed-badge");
+  if (!badge) return;
+  try {
+    const data = await api("/api/calls/missed-count");
+    const unseen = Number(data.missed_unseen) || 0;
+    badge.textContent = unseen > 99 ? "99+" : String(unseen);
+    badge.hidden = unseen <= 0;
+  } catch (error) {
+    badge.hidden = true;
+  }
+}
+
+function recentCallsQuery() {
+  const params = new URLSearchParams({ limit: "50", offset: String(recentCallsState.offset) });
+  if (recentCallsState.scope === "missed") params.set("missed", "true");
+  if (recentCallsState.direction) params.set("direction", recentCallsState.direction);
+  if (recentCallsState.subscription) params.set("subscription_id", recentCallsState.subscription);
+  return `/api/history/calls?${params.toString()}`;
+}
+
+function recentCallsSubscriptionOptions(items) {
+  const select = $("#recent-calls-subscription");
+  const previous = select.value;
+  const seen = new Map();
+  for (const item of items) {
+    if (!item.subscription_id || seen.has(item.subscription_id)) continue;
+    seen.set(item.subscription_id, item.iccid_masked || item.subscription_id);
+  }
+  while (select.options.length > 1) select.remove(1);
+  for (const [value, label] of seen.entries()) {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = value === "unknown" ? "归属未知" : `卡 ${label}`;
+    select.append(option);
+  }
+  if (previous && seen.has(previous)) select.value = previous;
+  else {
+    select.value = "";
+    recentCallsState.subscription = "";
+  }
+}
+
+function recentCallRow(call) {
+  const row = document.createElement("article");
+  row.className = "item";
+  const title = document.createElement("strong");
+  const name = recentCallContactName(call);
+  title.textContent = name ? `${name} · ${call.number}` : call.number;
+  const meta = document.createElement("p");
+  const direction = call.direction === "inbound" ? "呼入" : "呼出";
+  const when = new Date(call.started_at).toLocaleString();
+  const duration = call.duration_seconds ? ` · ${formatCallDuration(call.duration_seconds)}` : "";
+  const reason = call.end_reason_label ? ` · ${call.end_reason_label}` : "";
+  const missed = call.missed ? " · 未接" : "";
+  const card = call.attribution_unknown ? " · 归属未知" : (call.iccid_masked ? ` · 卡 ${call.iccid_masked}` : "");
+  meta.textContent = `${direction}${missed} · ${when}${duration}${reason}${card}`;
+  const actions = document.createElement("div");
+  actions.className = "sms-actions";
+  const redial = document.createElement("button");
+  redial.className = "secondary compact";
+  redial.type = "button";
+  redial.textContent = "回拨";
+  redial.addEventListener("click", () => void redialRecentCall(call));
+  const sms = document.createElement("button");
+  sms.className = "secondary compact";
+  sms.type = "button";
+  sms.textContent = "发短信";
+  sms.addEventListener("click", () => void smsRecentCall(call));
+  const save = document.createElement("button");
+  save.className = "secondary compact";
+  save.type = "button";
+  save.textContent = "保存联系人";
+  save.addEventListener("click", () => void saveRecentCallContact(call));
+  actions.append(redial, sms, save);
+  row.append(title, meta, actions);
+  return row;
+}
+
+async function redialRecentCall(call) {
+  try {
+    await api("/api/calls/redial", { method: "POST", body: JSON.stringify({ call_id: call.id }) });
+    notice(`已发起回拨：${call.number}`);
+    await loadSIP();
+    await loadRecentCalls();
+  } catch (error) {
+    notice(error.message);
+  }
+}
+
+async function smsRecentCall(call) {
+  const values = await showModal({
+    title: `发短信给 ${call.number}`,
+    message: "经已有短信发送通道发出，发送结果记入发件箱。",
+    confirmLabel: "发送",
+    fields: [{ name: "message", label: "短信内容", value: "", placeholder: "输入短信内容", required: true }],
+  });
+  if (!values || !values.message) return;
+  try {
+    await api("/api/calls/sms", { method: "POST", body: JSON.stringify({ call_id: call.id, message: values.message }) });
+    notice("短信已发送");
+    await loadSMS();
+  } catch (error) {
+    notice(error.message);
+  }
+}
+
+async function saveRecentCallContact(call) {
+  const existing = recentContactsByNormalized.get(call.number_normalized || "");
+  const values = await showModal({
+    title: "保存联系人",
+    message: `号码 ${call.number} 将保存在本地联系人中，来电与通话记录会显示该姓名。`,
+    confirmLabel: "保存",
+    fields: [{ name: "name", label: "姓名", value: existing ? existing.name : "", placeholder: "例如：张三", required: true }],
+  });
+  if (!values || !values.name) return;
+  try {
+    await api("/api/calls/save-contact", { method: "POST", body: JSON.stringify({ call_id: call.id, name: values.name }) });
+    notice("联系人已保存");
+    await loadRecentContacts();
+    await loadRecentCalls();
+  } catch (error) {
+    notice(error.message);
+  }
+}
+
+async function loadRecentCalls(reset = true) {
+  if (recentCallsState.loading) return;
+  recentCallsState.loading = true;
+  const list = $("#recent-calls-list");
+  const status = $("#recent-calls-status");
+  const more = $("#recent-calls-more");
+  try {
+    if (reset) recentCallsState.offset = 0;
+    await loadRecentContacts();
+    const data = await api(recentCallsQuery());
+    const items = data.items || [];
+    recentCallsState.total = data.total || 0;
+    recentCallsState.offset += items.length;
+    recentCallsSubscriptionOptions(items);
+    if (reset) list.replaceChildren();
+    if (!items.length && reset) {
+      list.className = "list empty";
+      list.textContent = "暂无通话记录";
+    } else {
+      list.classList.remove("empty");
+      list.append(...items.map((call) => recentCallRow(call)));
+    }
+    const shown = list.querySelectorAll(".item").length;
+    status.textContent = `共 ${recentCallsState.total} 条通话记录 · 已显示 ${shown} 条`;
+    more.hidden = shown >= recentCallsState.total || recentCallsState.total === 0;
+    // 用户已看到本页未接记录，清零角标；失败不阻塞列表展示。
+    try {
+      await api("/api/calls/missed/seen", { method: "POST", body: JSON.stringify({}) });
+      await refreshMissedBadge();
+    } catch (error) { /* 角标下次刷新时再清 */ }
+  } catch (error) {
+    status.textContent = `读取通话记录失败：${error.message}`;
+    notice(error.message);
+  } finally {
+    recentCallsState.loading = false;
+  }
+}
+
+$("#recent-calls-scope").addEventListener("change", (event) => {
+  recentCallsState.scope = event.currentTarget.value;
+  void loadRecentCalls();
+});
+$("#recent-calls-direction").addEventListener("change", (event) => {
+  recentCallsState.direction = event.currentTarget.value;
+  void loadRecentCalls();
+});
+$("#recent-calls-subscription").addEventListener("change", (event) => {
+  recentCallsState.subscription = event.currentTarget.value;
+  void loadRecentCalls();
+});
+$("#recent-calls-refresh").addEventListener("click", () => void loadRecentCalls());
+$("#recent-calls-more").addEventListener("click", () => void loadRecentCalls(false));
+
 document.querySelectorAll(".tab").forEach((tab) => {
   tab.addEventListener("click", () => {
     document.querySelectorAll(".tab").forEach((item) => {
@@ -1357,6 +2141,11 @@ document.querySelectorAll(".tab").forEach((tab) => {
     setNetworkActivityPolling(tab.dataset.view === "overview");
     if (tab.dataset.view === "esim") loadESIM();
     else setESIMHealthPolling(false);
+    if (tab.dataset.view === "calls") { void loadSIP(); void loadSipAudioDevices(); void loadRecentCalls(); }
+    if (tab.dataset.view === "tasks") void loadTasks();
+    if (tab.dataset.view === "notify") void loadNotify();
+    if (tab.dataset.view === "radio") setRadioPolling(true);
+    else setRadioPolling(false);
     if (tab.dataset.view === "network") loadNetwork();
     if (tab.dataset.view === "at") {
       requestAnimationFrame(() => {
@@ -1515,11 +2304,943 @@ $("#usbnet-mode-2").addEventListener("click", () => setUSBNetMode(2));
 $("#usbnet-mode-3").addEventListener("click", () => setUSBNetMode(3));
 $("#reboot-module").addEventListener("click", rebootModule);
 
+// --- USSD 与无线 (Item 2 + 3) -------------------------------------------
+let radioTimer = null;
+
+function setRadioPolling(enabled) {
+  clearInterval(radioTimer);
+  radioTimer = null;
+  if (!enabled) return;
+  void loadRadio();
+  radioTimer = setInterval(() => {
+    if ($("#radio").classList.contains("active")) void loadRadio();
+  }, 5000);
+}
+
+function ussdStateLabel(state) {
+  return { active: "等待回复", ended: "已结束", cancelled: "已取消", error: "出错", idle: "无会话" }[state] || state;
+}
+
+function deliveryStateLabel(state) {
+  return { sent: "已发送 · 等待回执", delivered: "已送达", pending: "投递中", failed: "投递失败", unknown: "未知" }[state] || state;
+}
+
+function renderUSSDSession(session) {
+  const status = $("#ussd-status");
+  const result = $("#ussd-result");
+  const replyForm = $("#ussd-reply-form");
+  if (!session) {
+    status.textContent = "无会话";
+    result.textContent = "暂无 USSD 返回";
+    replyForm.hidden = true;
+    return;
+  }
+  status.textContent = `${ussdStateLabel(session.state)} · ${session.code} · 通道 ${session.path || "at-cusd"}`;
+  result.textContent = session.text || session.error || "（无文本返回）";
+  replyForm.hidden = session.state !== "active";
+}
+
+async function loadUSSD() {
+  try {
+    const data = await api("/api/ussd/status");
+    renderUSSDSession(data.session || null);
+  } catch (error) {
+    $("#ussd-status").textContent = `读取失败：${error.message}`;
+  }
+  try {
+    const ims = await api("/api/ussd/ims");
+    $("#ussd-ims-line").textContent = ims.ims_state === "unknown" || ims.ims_error
+      ? "IMS 状态未知：当前固件未返回有效状态。"
+      : ims.ims_registered
+      ? "IMS 已注册，但本机构无 IMS USSI 栈，USSD 始终走 AT+CUSD。"
+      : "IMS 未注册。IMS USSI（TS 24.390）本机构不支持，USSD 走 AT+CUSD。";
+  } catch (error) {
+    $("#ussd-ims-line").textContent = `IMS 状态读取失败：${error.message}`;
+  }
+}
+
+async function loadDelivery() {
+  const list = $("#delivery-list");
+  try {
+    const items = await api("/api/sms/delivery");
+    if (!items.length) {
+      list.textContent = "暂无送达记录";
+      list.classList.add("empty");
+      return;
+    }
+    list.classList.remove("empty");
+    list.replaceChildren(...items.map((item) => {
+      const row = document.createElement("div");
+      row.className = "list-row";
+      const when = item.updated_at ? new Date(item.updated_at).toLocaleString() : "";
+      row.textContent = `MR ${item.message_ref} · ${item.to} · ${deliveryStateLabel(item.state)}${item.status_text ? " · " + item.status_text : ""} · ${when}`;
+      return row;
+    }));
+  } catch (error) {
+    list.textContent = `读取失败：${error.message}`;
+  }
+}
+
+async function loadServingCell() {
+  const el = $("#serving-cell");
+  try {
+    const cell = await api("/api/radio/cell");
+    el.classList.remove("empty");
+    el.textContent = `EARFCN ${cell.earfcn} · PCI ${cell.pci} · RSRP ${cell.rsrp} dBm · RSRQ ${cell.rsrq} dB · SINR ${cell.sinr} dB · ${cell.band || cell.rat}`;
+  } catch (error) {
+    el.textContent = `读取失败：${error.message}`;
+  }
+}
+
+async function loadOperators() {
+  const status = $("#operator-scan-status");
+  const list = $("#operator-list");
+  try {
+    const data = await api("/api/radio/operators");
+    if (data.state === "idle") {
+      status.textContent = "尚未扫描运营商";
+      list.textContent = "暂无扫描结果";
+      list.classList.add("empty");
+      return;
+    }
+    if (data.state === "scanning") {
+      status.textContent = "正在扫描运营商（30–120 秒），请稍候…";
+      return;
+    }
+    if (data.state === "error") {
+      status.textContent = `扫描失败：${data.error || "未知错误"}`;
+      return;
+    }
+    const operators = data.operators || [];
+    status.textContent = operators.length ? `扫描完成：${operators.length} 个运营商` : "扫描完成，未发现运营商";
+    if (!operators.length) {
+      list.textContent = "暂无扫描结果";
+      list.classList.add("empty");
+      return;
+    }
+    list.classList.remove("empty");
+    list.replaceChildren(...operators.map((op) => {
+      const row = document.createElement("button");
+      row.type = "button";
+      row.className = "list-row operator-row";
+      row.textContent = `${op.operator_name || op.plmn} · PLMN ${op.plmn} · ${op.status}${op.rats && op.rats.length ? " · " + op.rats.join("/") : ""}`;
+      row.addEventListener("click", () => {
+        $("#operator-mode").value = "manual";
+        $("#operator-plmn").value = op.plmn;
+        if (op.rats && op.rats.length) $("#operator-rat").value = op.rats[0];
+        notice(`已选择 ${op.operator_name || op.plmn}，点“应用”切换`);
+      });
+      return row;
+    }));
+  } catch (error) {
+    status.textContent = `读取失败：${error.message}`;
+  }
+}
+
+async function loadCellLock() {
+  const status = $("#cell-lock-status");
+  const saved = $("#cell-lock-saved");
+  try {
+    const data = await api("/api/radio/cell-lock");
+    status.textContent = data.supported === false
+      ? "当前固件无法查询小区锁定状态"
+      : data.locked
+      ? `已锁定：EARFCN ${data.earfcn} / PCI ${data.pci}`
+      : "未锁定（自动选小区）";
+    if (data.saved && data.saved.cell_lock) {
+      const pref = data.saved.cell_lock;
+      saved.textContent = pref.locked
+        ? `已保存偏好（ICCID ${data.iccid || "未知"}）：锁定 EARFCN ${pref.earfcn} / PCI ${pref.pci}`
+        : "已保存偏好：不锁定";
+    } else {
+      saved.textContent = "";
+    }
+  } catch (error) {
+    status.textContent = `读取失败：${error.message}`;
+  }
+}
+
+async function loadOperatorCurrent() {
+  try {
+    const data = await api("/api/radio/operator");
+    const current = data.current || {};
+    $("#operator-status").textContent = current.mode === "manual"
+      ? `当前：手动 ${current.plmn || ""}`
+      : "当前：自动选择";
+  } catch (error) {
+    $("#operator-status").textContent = `读取失败：${error.message}`;
+  }
+}
+
+async function loadRadio() {
+  const status = $("#radio-status");
+  status.textContent = "正在读取…";
+  await Promise.all([loadUSSD(), loadDelivery(), loadServingCell(), loadOperators(), loadCellLock(), loadOperatorCurrent(), loadGNSS(), loadModules()]);
+  status.textContent = `已更新 ${new Date().toLocaleTimeString()}`;
+}
+
+$("#ussd-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const code = $("#ussd-code").value.trim();
+  const via = $("#ussd-via").value;
+  const status = $("#ussd-status");
+  status.textContent = "正在发送 USSD…";
+  try {
+    const data = await api("/api/ussd", { method: "POST", body: JSON.stringify({ code, via }) });
+    renderUSSDSession(data.session);
+    if (data.ims_note) notice(data.ims_note);
+  } catch (error) {
+    status.textContent = `发送失败：${error.message}`;
+    notice(error.message);
+    await loadUSSD();
+  }
+});
+
+$("#ussd-reply-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const response = $("#ussd-reply").value.trim();
+  const status = $("#ussd-status");
+  status.textContent = "正在回复…";
+  try {
+    const data = await api("/api/ussd/continue", { method: "POST", body: JSON.stringify({ response }) });
+    renderUSSDSession(data.session);
+    $("#ussd-reply").value = "";
+  } catch (error) {
+    status.textContent = `回复失败：${error.message}`;
+    notice(error.message);
+    await loadUSSD();
+  }
+});
+
+$("#ussd-cancel").addEventListener("click", async () => {
+  try {
+    const data = await api("/api/ussd/cancel", { method: "POST", body: "{}" });
+    renderUSSDSession(data.session);
+    notice("USSD 会话已取消");
+  } catch (error) {
+    notice(error.message);
+  }
+});
+
+$("#refresh-radio").addEventListener("click", () => void loadRadio());
+$("#refresh-delivery").addEventListener("click", () => void loadDelivery());
+$("#refresh-cell").addEventListener("click", () => void loadServingCell());
+
+$("#scan-operators").addEventListener("click", async () => {
+  $("#operator-scan-status").textContent = "正在启动扫描…";
+  try {
+    await api("/api/radio/operators/scan", { method: "POST", body: "{}" });
+    await loadOperators();
+  } catch (error) {
+    $("#operator-scan-status").textContent = `扫描启动失败：${error.message}`;
+    notice(error.message);
+  }
+});
+
+$("#operator-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const mode = $("#operator-mode").value;
+  const plmn = $("#operator-plmn").value.trim();
+  const rat = $("#operator-rat").value;
+  const status = $("#operator-status");
+  if (mode === "manual") {
+    const confirmed = await showModal({
+      title: "切换运营商",
+      message: `手动切换到 PLMN ${plmn || "（未填）"} 会使模块重新注册，数据连接可能中断约一分钟。确定继续吗？`,
+      confirmLabel: "确定切换",
+    });
+    if (!confirmed) return;
+  }
+  status.textContent = "正在切换运营商…";
+  try {
+    const data = await api("/api/radio/operator", { method: "POST", body: JSON.stringify({ mode, plmn, rat }) });
+    status.textContent = `已切换：${data.selection.mode === "manual" ? "手动 " + (data.selection.plmn || "") : "自动选择"}`;
+    notice("运营商已切换");
+    await loadOperators();
+  } catch (error) {
+    status.textContent = `切换失败：${error.message}`;
+    notice(error.message);
+  }
+});
+
+$("#cell-lock-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const earfcn = Number($("#cell-earfcn").value);
+  const pci = Number($("#cell-pci").value);
+  const confirmed = await showModal({
+    title: "锁定小区",
+    message: `锁定到 EARFCN ${earfcn} / PCI ${pci} 后，模块只驻留该小区；重启模块后锁定失效。确定继续吗？`,
+    confirmLabel: "确定锁定",
+  });
+  if (!confirmed) return;
+  const status = $("#cell-lock-status");
+  status.textContent = "正在锁定小区…";
+  try {
+    const data = await api("/api/radio/cell-lock", { method: "POST", body: JSON.stringify({ earfcn, pci }) });
+    status.textContent = `已锁定：EARFCN ${data.earfcn} / PCI ${data.pci}${data.verified ? "（已向模块确认）" : "（模块已接受，未能读回确认）"}`;
+    notice("小区已锁定");
+    await loadCellLock();
+  } catch (error) {
+    status.textContent = `锁定失败：${error.message}`;
+    notice(error.message);
+  }
+});
+
+$("#cell-unlock").addEventListener("click", async () => {
+  const status = $("#cell-lock-status");
+  status.textContent = "正在解除锁定…";
+  try {
+    await api("/api/radio/cell-unlock", { method: "POST", body: "{}" });
+    status.textContent = "未锁定（自动选小区）";
+    notice("小区锁定已解除");
+    await loadCellLock();
+  } catch (error) {
+    status.textContent = `解除失败：${error.message}`;
+    notice(error.message);
+  }
+});
+
+// --- GNSS 与模块 (Item 6) -----------------------------------------------
+async function loadGNSS() {
+  const line = $("#gnss-line");
+  const detail = $("#gnss-detail");
+  const toggle = $("#gnss-toggle");
+  try {
+    const st = await api("/api/gnss");
+    toggle.textContent = st.enabled ? "关闭定位" : "开启定位";
+    toggle.dataset.enabled = String(!!st.enabled);
+    if (st.fix && st.latitude != null && st.longitude != null) {
+      line.textContent = `已定位：${st.latitude.toFixed(5)}, ${st.longitude.toFixed(5)}${st.satellites != null ? ` · ${st.satellites} 颗星` : ""}`;
+      detail.classList.remove("empty");
+      detail.textContent = `纬度 ${st.latitude}，经度 ${st.longitude}，海拔 ${st.altitude_m ?? "--"} 米，HDOP ${st.hdop ?? "--"}，速度 ${st.speed_kmh ?? "--"} km/h，UTC ${st.utc_time || "--"} ${st.date || ""}`;
+    } else {
+      line.textContent = st.enabled ? "定位已开启，等待卫星信号…" : "定位未开启";
+      detail.classList.add("empty");
+      detail.textContent = st.note || (st.enabled ? "未定位：需要 GPS 天线与开阔天空" : "点击“开启定位”启动接收机");
+    }
+  } catch (error) {
+    line.textContent = `GNSS 读取失败：${error.message}`;
+  }
+}
+
+$("#gnss-toggle").addEventListener("click", async () => {
+  const toggle = $("#gnss-toggle");
+  const enabled = toggle.dataset.enabled !== "true";
+  toggle.disabled = true;
+  try {
+    await api("/api/gnss", { method: "POST", body: JSON.stringify({ enabled }) });
+    notice(enabled ? "定位已开启" : "定位已关闭");
+    await loadGNSS();
+  } catch (error) {
+    notice(error.message);
+  } finally {
+    toggle.disabled = false;
+  }
+});
+
+async function loadModules() {
+  const list = $("#modules-list");
+  try {
+    const data = await api("/api/modules");
+    list.classList.remove("empty");
+    list.innerHTML = "";
+    if (!data.modules || data.modules.length === 0) {
+      list.classList.add("empty");
+      list.textContent = "未发现模块";
+      return;
+    }
+    data.modules.forEach((m) => {
+      const item = document.createElement("div");
+      item.className = "item";
+      item.textContent = `${m.product || "模块"} ${m.vendor_id}:${m.product_id} · ${m.location_id}${m.active ? " · 当前模块" : ""}${m.imei ? ` · IMEI ${m.imei}` : ""}${m.iccid ? ` · ICCID ${m.iccid}` : ""}${m.note ? ` · ${m.note}` : ""}`;
+      list.appendChild(item);
+    });
+  } catch (error) {
+    list.classList.add("empty");
+    list.textContent = `模块读取失败：${error.message}`;
+  }
+}
+
+$("#refresh-modules").addEventListener("click", () => void loadModules());
+
+// --- 定时任务 (Item 4) + MCP 状态 (Item 7) --------------------------------
+function taskScheduleLabel(t) {
+  if (t.daily) return `每天 ${t.daily}`;
+  if (t.interval_m) return `每 ${t.interval_m} 分钟`;
+  return "未排程";
+}
+
+function taskKindLabel(kind) {
+  return { ussd: "USSD 查询", sms: "发送短信", reboot: "重启模块" }[kind] || kind;
+}
+
+function renderTasks(tasks) {
+  const list = $("#tasks-list");
+  list.innerHTML = "";
+  if (!tasks || tasks.length === 0) {
+    list.classList.add("empty");
+    list.textContent = "暂无任务";
+    return;
+  }
+  list.classList.remove("empty");
+  tasks.forEach((t) => {
+    const item = document.createElement("div");
+    item.className = "item";
+    const next = t.next_run_at ? new Date(t.next_run_at).toLocaleString() : "--";
+    const last = t.last_run_at ? new Date(t.last_run_at).toLocaleString() : "未运行";
+    const target = t.kind === "ussd" ? t.code : t.kind === "sms" ? `${t.to}：${t.text}` : "模块重启";
+    item.textContent = `${t.enabled ? "●" : "○"} ${t.name} · ${taskKindLabel(t.kind)} · ${target} · ${taskScheduleLabel(t)} · 下次 ${next} · 上次 ${last}${t.last_result ? ` · ${t.last_result}` : ""} · 共 ${t.run_count || 0} 次`;
+    const actions = document.createElement("span");
+    actions.style.marginLeft = "8px";
+    const toggle = document.createElement("button");
+    toggle.className = "secondary";
+    toggle.type = "button";
+    toggle.textContent = t.enabled ? "停用" : "启用";
+    toggle.addEventListener("click", async () => {
+      try {
+        await api("/api/tasks/enable", { method: "POST", body: JSON.stringify({ id: t.id, enabled: !t.enabled }) });
+        await loadTasks();
+      } catch (error) { notice(error.message); }
+    });
+    const run = document.createElement("button");
+    run.className = "secondary";
+    run.type = "button";
+    run.textContent = "立即执行";
+    run.addEventListener("click", async () => {
+      try {
+        await api("/api/tasks/run-now", { method: "POST", body: JSON.stringify({ id: t.id }) });
+        notice("任务已启动，稍后刷新查看结果");
+        setTimeout(() => void loadTasks(), 3000);
+      } catch (error) { notice(error.message); }
+    });
+    const del = document.createElement("button");
+    del.className = "secondary danger";
+    del.type = "button";
+    del.textContent = "删除";
+    del.addEventListener("click", async () => {
+      const confirmed = await showModal({ title: "删除任务", message: `确定删除任务“${t.name}”吗？`, confirmLabel: "删除", danger: true });
+      if (!confirmed) return;
+      try {
+        await api("/api/tasks/delete", { method: "POST", body: JSON.stringify({ id: t.id }) });
+        await loadTasks();
+      } catch (error) { notice(error.message); }
+    });
+    actions.append(toggle, run, del);
+    item.appendChild(actions);
+    list.appendChild(item);
+  });
+}
+
+async function loadTasks() {
+  const status = $("#tasks-status");
+  status.textContent = "正在读取…";
+  try {
+    const tasks = await api("/api/tasks");
+    renderTasks(tasks);
+    status.textContent = `已更新 ${new Date().toLocaleTimeString()} · ${tasks.length} 个任务`;
+  } catch (error) {
+    status.textContent = `读取失败：${error.message}`;
+  }
+  try {
+    const mcp = await api("/api/mcp/status");
+    $("#mcp-line").textContent = mcp.token_configured
+      ? "MCP 已启用：POST /api/mcp（Bearer token，见服务端 mcp-token 文件，0600），只读工具集；敏感操作一律 501 拒绝。"
+      : "MCP 未启用。";
+  } catch (error) {
+    $("#mcp-line").textContent = `MCP 状态读取失败：${error.message}`;
+  }
+}
+
+$("#refresh-tasks").addEventListener("click", () => void loadTasks());
+
+function syncTaskFormFields() {
+  const kind = $("#task-kind").value;
+  $("#task-code").hidden = kind !== "ussd";
+  $("#task-to").hidden = kind !== "sms";
+  $("#task-text").hidden = kind !== "sms";
+}
+
+$("#task-kind").addEventListener("change", syncTaskFormFields);
+syncTaskFormFields();
+
+$("#task-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const status = $("#task-form-status");
+  const kind = $("#task-kind").value;
+  const body = {
+    name: $("#task-name").value.trim(),
+    kind,
+    code: $("#task-code").value.trim(),
+    to: $("#task-to").value.trim(),
+    text: $("#task-text").value.trim(),
+    interval_m: parseInt($("#task-interval").value, 10) || 0,
+    daily: $("#task-daily").value.trim(),
+  };
+  status.textContent = "正在创建任务…";
+  try {
+    await api("/api/tasks", { method: "POST", body: JSON.stringify(body) });
+    status.textContent = "任务已创建";
+    notice("任务已创建");
+    event.target.reset();
+    syncTaskFormFields();
+    await loadTasks();
+  } catch (error) {
+    status.textContent = `创建失败：${error.message}`;
+    notice(error.message);
+  }
+});
+
 loadStatus();
+
+loadStatus();
+loadSubscription();
 loadSMS();
+refreshMissedBadge();
 loadSidebarConnection();
+setSIPPolling();
 setNetworkTrafficPolling(true);
 setNetworkActivityPolling(true);
 setInterval(loadStatus, 10000);
 setInterval(loadSMS, 5000);
+setInterval(refreshMissedBadge, 30000);
 setInterval(loadSidebarConnection, 10000);
+
+// --- Notifications (Batch 1) ---------------------------------------------
+let notifyView = null;
+
+function notifyField(form, name) {
+  const el = form.querySelector(`[name="${name}"]`);
+  return el ? el.value.trim() : "";
+}
+
+function notifySplitList(value) {
+  return value.split(/[,，\n]/).map((s) => s.trim()).filter(Boolean);
+}
+
+function fillNotifyForm(channel, view) {
+  const form = document.querySelector(`[data-notify-form="${channel}"]`);
+  if (!form) return;
+  const data = view[channel] || {};
+  const enabled = form.querySelector(".notify-enabled");
+  if (enabled) enabled.checked = !!data.enabled;
+  const set = (name, value) => {
+    const el = form.querySelector(`[name="${name}"]`);
+    if (el && value !== undefined && value !== null) el.value = value;
+  };
+  if (channel === "telegram") {
+    set("chat_id", data.chat_id || "");
+    set("admin_id", data.admin_id || "");
+    set("base_url", data.base_url || "");
+  } else if (channel === "bark") {
+    set("group", data.group || "");
+    set("level", data.level || "");
+  } else if (channel === "email") {
+    set("smtp_host", data.smtp_host || "");
+    set("smtp_port", data.smtp_port || "");
+    set("username", data.username || "");
+    set("from_address", data.from_address || "");
+    const useSSL = form.querySelector('[name="use_ssl"]');
+    if (useSSL) useSSL.checked = !!data.use_ssl;
+  } else if (channel === "pushplus") {
+    set("topic", data.topic || "");
+    set("channel", data.channel || "");
+  } else if (channel === "webhook") {
+    set("timeout_ms", data.timeout_ms || "");
+    set("retry_max", data.retry_max || "");
+  }
+}
+
+function renderNotifyLog(entries) {
+  const list = $("#notify-log");
+  if (!entries || entries.length === 0) {
+    list.classList.add("empty");
+    list.textContent = "暂无推送记录";
+    return;
+  }
+  list.classList.remove("empty");
+  list.innerHTML = "";
+  entries.forEach((e) => {
+    const item = document.createElement("div");
+    item.className = "list-item";
+    const ok = e.ok ? "成功" : "失败";
+    item.textContent = `${e.time} · ${e.channel} · ${e.kind} · ${ok} · ${e.title}${e.error ? " — " + e.error : ""}`;
+    list.appendChild(item);
+  });
+}
+
+async function loadNotify() {
+  const status = $("#notify-status");
+  status.textContent = "正在读取…";
+  try {
+    const view = await api("/api/notify/settings");
+    notifyView = view;
+    $("#notify-sms").checked = view.notify_sms !== false;
+    $("#notify-calls").checked = view.notify_calls !== false;
+    ["telegram", "feishu", "bark", "email", "pushplus", "webhook"].forEach((c) => fillNotifyForm(c, view));
+    const summary = (view.channels || []).map((c) => `${c.channel}${c.enabled ? "✓" : "✗"}${c.configured ? "" : "(未配置)"}`).join(" · ");
+    status.textContent = `已更新 ${new Date().toLocaleTimeString()} · ${summary}`;
+    const log = await api("/api/notify/log");
+    renderNotifyLog(log.entries);
+  } catch (error) {
+    status.textContent = `读取失败：${error.message}`;
+  }
+}
+
+$("#refresh-notify").addEventListener("click", () => void loadNotify());
+
+$("#notify-toggles").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const status = $("#notify-toggles-status");
+  status.textContent = "正在保存…";
+  try {
+    await api("/api/notify/settings", {
+      method: "POST",
+      body: JSON.stringify({ notify_sms: $("#notify-sms").checked, notify_calls: $("#notify-calls").checked }),
+    });
+    status.textContent = "已保存";
+    notice("通知开关已保存");
+  } catch (error) {
+    status.textContent = `保存失败：${error.message}`;
+  }
+});
+
+document.querySelectorAll("[data-notify-form]").forEach((form) => {
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const channel = form.dataset.notifyForm;
+    const statusEl = form.querySelector(".notify-form-status");
+    const enabled = form.querySelector(".notify-enabled")?.checked || false;
+    const body = {};
+    if (channel === "telegram") {
+      body.telegram = {
+        enabled,
+        bot_token: notifyField(form, "bot_token"),
+        chat_id: parseInt(notifyField(form, "chat_id"), 10) || 0,
+        admin_id: parseInt(notifyField(form, "admin_id"), 10) || 0,
+        base_url: notifyField(form, "base_url"),
+      };
+    } else if (channel === "feishu") {
+      body.feishu = { enabled, webhook_url: notifyField(form, "webhook_url") };
+    } else if (channel === "bark") {
+      body.bark = {
+        enabled,
+        urls: notifySplitList(notifyField(form, "urls")),
+        group: notifyField(form, "group"),
+        level: notifyField(form, "level"),
+      };
+    } else if (channel === "email") {
+      body.email = {
+        enabled,
+        use_ssl: form.querySelector('[name="use_ssl"]')?.checked || false,
+        smtp_host: notifyField(form, "smtp_host"),
+        smtp_port: parseInt(notifyField(form, "smtp_port"), 10) || 0,
+        username: notifyField(form, "username"),
+        password: notifyField(form, "password"),
+        from_address: notifyField(form, "from_address"),
+        to_addresses: notifySplitList(notifyField(form, "to_addresses")),
+      };
+    } else if (channel === "pushplus") {
+      body.pushplus = {
+        enabled,
+        token: notifyField(form, "token"),
+        topic: notifyField(form, "topic"),
+        channel: notifyField(form, "channel"),
+      };
+    } else if (channel === "webhook") {
+      body.webhook = {
+        enabled,
+        urls: notifySplitList(notifyField(form, "urls")),
+        secret: notifyField(form, "secret"),
+        timeout_ms: parseInt(notifyField(form, "timeout_ms"), 10) || 0,
+        retry_max: parseInt(notifyField(form, "retry_max"), 10) || 0,
+      };
+    }
+    // Only send non-empty fields: the form never shows stored URLs or
+    // secrets, so an untouched empty input must not wipe them.
+    const ch = body[channel];
+    Object.keys(ch).forEach((k) => {
+      if (k === "enabled") return;
+      const v = ch[k];
+      if (v === "" || (Array.isArray(v) && v.length === 0)) delete ch[k];
+      if ((k === "timeout_ms" || k === "retry_max") && v === 0) delete ch[k];
+    });
+    statusEl.textContent = "正在保存…";
+    try {
+      await api("/api/notify/settings", { method: "POST", body: JSON.stringify(body) });
+      statusEl.textContent = "已保存";
+      notice(`${channel} 设置已保存`);
+      form.querySelectorAll('input[type="password"]').forEach((el) => { el.value = ""; });
+      await loadNotify();
+    } catch (error) {
+      statusEl.textContent = `保存失败：${error.message}`;
+    }
+  });
+});
+
+document.querySelectorAll("[data-notify-test]").forEach((button) => {
+  button.addEventListener("click", async () => {
+    const channel = button.dataset.notifyTest;
+    const original = button.textContent;
+    button.textContent = "测试中…";
+    button.disabled = true;
+    try {
+      const result = await api("/api/notify/test", { method: "POST", body: JSON.stringify({ channel }) });
+      if (result.ok) {
+        notice(`${channel} 测试成功`);
+      } else {
+        notice(`${channel} 测试未发送：${result.error || "未知原因"}`);
+      }
+    } catch (error) {
+      notice(`${channel} 测试失败：${error.message}`);
+    } finally {
+      button.textContent = original;
+      button.disabled = false;
+      await loadNotify();
+    }
+  });
+});
+
+/* delivery-4: 短信会话、搜索、草稿与发送状态 ---------------------------------- */
+/* 只读交付点 2 的历史接口 + 本交付点的新会话接口；发送复用 POST /api/sms/send。 */
+let convCurrentPeer = ""; // 标准化号码
+let convCurrentPeerRaw = "";
+let convSearchMode = false;
+let convDraftTimer = null;
+
+function convEl(id) { return document.getElementById(id); }
+
+async function loadConversations() {
+  const list = convEl("conversations-list");
+  const status = convEl("conversations-status");
+  try {
+    const result = await api("/api/conversations?limit=50");
+    const totalUnread = result.items.reduce((n, c) => n + (c.unread_count || 0), 0);
+    status.textContent = `共 ${result.total} 个会话 · 未读 ${totalUnread} 条`;
+    if (!result.items.length) {
+      list.className = "list empty";
+      list.textContent = "暂无会话";
+      return;
+    }
+    list.className = "list";
+    list.replaceChildren(...result.items.map((conv) => {
+      const row = document.createElement("article");
+      row.className = "item conv-item";
+      row.tabIndex = 0;
+      row.setAttribute("role", "button");
+      const peer = document.createElement("strong");
+      peer.textContent = conv.peer || conv.peer_normalized;
+      const preview = document.createElement("p");
+      preview.textContent = (conv.last_direction === "out" ? "我：" : "") + (conv.last_body || "");
+      const meta = document.createElement("div");
+      meta.className = "conv-meta";
+      const time = document.createElement("time");
+      time.textContent = new Date(conv.last_at).toLocaleString();
+      meta.append(time);
+      if (conv.unread_count > 0) {
+        const badge = document.createElement("span");
+        badge.className = "conv-unread-badge";
+        badge.textContent = `未读 ${conv.unread_count}`;
+        meta.append(badge);
+      }
+      if (conv.last_direction === "out" && conv.last_outbox_status_label) {
+        const st = document.createElement("small");
+        st.textContent = conv.last_outbox_status_label;
+        meta.append(st);
+      }
+      const sub = document.createElement("small");
+      sub.textContent = conv.attribution_unknown ? "归属未知" : `卡 ${conv.subscription_id}`;
+      meta.append(sub);
+      row.append(peer, preview, meta);
+      const open = () => void openConversation(conv.peer_normalized, conv.peer || conv.peer_normalized);
+      row.addEventListener("click", open);
+      row.addEventListener("keydown", (event) => { if (event.key === "Enter") open(); });
+      return row;
+    }));
+  } catch (error) {
+    status.textContent = `会话加载失败：${error.message}`;
+  }
+}
+
+async function searchConversations() {
+  const q = convEl("conv-search").value.trim();
+  const list = convEl("conversations-list");
+  if (!q) {
+    convSearchMode = false;
+    await loadConversations();
+    return;
+  }
+  convSearchMode = true;
+  try {
+    const result = await api(`/api/conversations/search?q=${encodeURIComponent(q)}&limit=50`);
+    convEl("conversations-status").textContent = `搜索“${q}”：${result.total} 条`;
+    if (!result.items.length) {
+      list.className = "list empty";
+      list.textContent = "没有匹配的短信";
+      return;
+    }
+    list.className = "list";
+    list.replaceChildren(...result.items.map((msg) => {
+      const row = document.createElement("article");
+      row.className = "item conv-item";
+      const peer = document.createElement("strong");
+      peer.textContent = msg.peer || msg.peer_normalized;
+      const content = document.createElement("p");
+      content.textContent = msg.body;
+      const time = document.createElement("time");
+      time.textContent = new Date(msg.received_at).toLocaleString();
+      row.append(peer, content, time);
+      row.addEventListener("click", () => void openConversation(msg.peer_normalized, msg.peer || msg.peer_normalized));
+      return row;
+    }));
+  } catch (error) {
+    notice(error.message);
+  }
+}
+
+async function openConversation(peerNormalized, peerRaw) {
+  convCurrentPeer = peerNormalized;
+  convCurrentPeerRaw = peerRaw;
+  convEl("conversation-thread").hidden = false;
+  convEl("thread-peer").textContent = peerRaw;
+  convEl("thread-message").value = "";
+  convEl("thread-draft-status").textContent = "";
+  convEl("thread-send-status").textContent = "";
+  await loadThread();
+  try {
+    await api("/api/conversations/read", { method: "POST", body: JSON.stringify({ peer: peerNormalized }) });
+  } catch (error) { /* 未读标记失败不阻塞看消息 */ }
+  await loadConversations();
+  try {
+    const drafts = await api("/api/conversations/drafts");
+    const draft = (drafts.items || []).find((d) => d.peer_normalized === peerNormalized);
+    if (draft && draft.body) {
+      convEl("thread-message").value = draft.body;
+      convEl("thread-draft-status").textContent = `已恢复草稿 · ${new Date(draft.updated_at).toLocaleString()}`;
+    }
+  } catch (error) { /* 草稿读失败不阻塞 */ }
+  convEl("thread-message").focus();
+}
+
+async function loadThread() {
+  const box = convEl("thread-messages");
+  try {
+    const result = await api(`/api/conversations/thread?peer=${encodeURIComponent(convCurrentPeer)}&limit=50`);
+    convEl("thread-meta").textContent = `共 ${result.total} 条 · ${convCurrentPeerRaw}`;
+    if (!result.items.length) {
+      box.className = "list empty";
+      box.textContent = "暂无消息";
+      return;
+    }
+    box.className = "list conv-thread-list";
+    box.replaceChildren(...result.items.map((msg) => {
+      const row = document.createElement("article");
+      row.className = `item conv-message ${msg.direction === "out" ? "conv-out" : "conv-in"}`;
+      const who = document.createElement("strong");
+      who.textContent = msg.direction === "out" ? "我" : (msg.peer || msg.peer_normalized);
+      const content = document.createElement("p");
+      content.textContent = msg.body;
+      const meta = document.createElement("div");
+      meta.className = "conv-meta";
+      const time = document.createElement("time");
+      time.textContent = new Date(msg.received_at).toLocaleString();
+      meta.append(time);
+      if (msg.direction === "out" && msg.outbox_status_label) {
+        const st = document.createElement("small");
+        st.textContent = msg.outbox_status_label;
+        if (msg.outbox_status === "uncertain") st.textContent += "（无法确认是否已发送，请勿重复发送）";
+        if (msg.outbox_status === "failed") st.textContent += "（已证明未发送，可重发）";
+        meta.append(st);
+      }
+      if (msg.concat_total) {
+        const seg = document.createElement("small");
+        seg.textContent = `长短信 ${msg.concat_segments || 1}/${msg.concat_total} 段`;
+        meta.append(seg);
+      }
+      row.append(who, content, meta);
+      return row;
+    }));
+  } catch (error) {
+    box.className = "list empty";
+    box.textContent = `加载失败：${error.message}`;
+  }
+}
+
+function scheduleDraftSave() {
+  clearTimeout(convDraftTimer);
+  convDraftTimer = setTimeout(async () => {
+    if (!convCurrentPeer) return;
+    const body = convEl("thread-message").value;
+    try {
+      await api("/api/conversations/drafts", { method: "PUT", body: JSON.stringify({ peer: convCurrentPeer, body }) });
+      convEl("thread-draft-status").textContent = body.trim() ? `草稿已保存 · ${new Date().toLocaleTimeString()}` : "草稿已清空";
+    } catch (error) {
+      convEl("thread-draft-status").textContent = `草稿保存失败：${error.message}`;
+    }
+  }, 800);
+}
+
+function downloadExport(peer) {
+  const params = new URLSearchParams({ format: "csv" });
+  if (peer) params.set("peer", peer);
+  const a = document.createElement("a");
+  a.href = `/api/conversations/export?${params.toString()}`;
+  a.download = "";
+  document.body.append(a);
+  a.click();
+  a.remove();
+}
+
+convEl("conv-search-btn").addEventListener("click", () => void searchConversations());
+convEl("conv-search").addEventListener("keydown", (event) => {
+  if (event.key === "Enter") { event.preventDefault(); void searchConversations(); }
+});
+convEl("conv-search-clear").addEventListener("click", async () => {
+  convEl("conv-search").value = "";
+  convSearchMode = false;
+  await loadConversations();
+});
+convEl("conv-export-all").addEventListener("click", () => downloadExport(""));
+convEl("thread-export").addEventListener("click", () => downloadExport(convCurrentPeer));
+convEl("thread-close").addEventListener("click", async () => {
+  convCurrentPeer = "";
+  convCurrentPeerRaw = "";
+  convEl("conversation-thread").hidden = true;
+  await loadConversations();
+});
+convEl("thread-message").addEventListener("input", scheduleDraftSave);
+convEl("thread-draft-discard").addEventListener("click", async () => {
+  if (!convCurrentPeer) return;
+  try {
+    await api(`/api/conversations/drafts?peer=${encodeURIComponent(convCurrentPeer)}`, { method: "DELETE" });
+    convEl("thread-message").value = "";
+    convEl("thread-draft-status").textContent = "草稿已丢弃";
+  } catch (error) {
+    notice(error.message);
+  }
+});
+convEl("thread-send-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const input = convEl("thread-message");
+  const text = input.value.trim();
+  if (!text || !convCurrentPeer) return;
+  const status = convEl("thread-send-status");
+  status.textContent = "正在发送…";
+  try {
+    const result = await api("/api/sms/send", { method: "POST", body: JSON.stringify({ phone: convCurrentPeer, message: text }) });
+    input.value = "";
+    try {
+      await api(`/api/conversations/drafts?peer=${encodeURIComponent(convCurrentPeer)}`, { method: "DELETE" });
+    } catch (error) { /* 发送成功后草稿删失败不阻塞 */ }
+    convEl("thread-draft-status").textContent = "";
+    status.textContent = `已提交（${result.segments || 1} 段）· 送达状态见上方消息`;
+    await loadThread();
+    await loadConversations();
+  } catch (error) {
+    status.textContent = `发送失败：${error.message}（已记为“结果不确定”，请勿重复发送）`;
+  }
+});
+document.querySelector('.tab[data-view="sms"]').addEventListener("click", () => void loadConversations());
+loadConversations();
+setInterval(() => {
+  if (!convSearchMode && $("#sms").classList.contains("active") && !convCurrentPeer) void loadConversations();
+}, 30000);

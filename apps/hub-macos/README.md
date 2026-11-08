@@ -23,7 +23,7 @@ SwiftUI 原生界面，不使用 WebView。短信、电话、eSIM、网络与 AT
 ```sh
 sh scripts/package-macos-arm64.sh native-backend
 PKG_CONFIG_PATH="$TMPDIR/dj4ghub-macos-package-arm64/libusb-source" \
-  sh scripts/package-macos-app.sh dist/release/DJ-4G-Hub-macOS-arm64-native-backend
+  sh scripts/package-macos-native-app.sh dist/release/DJ-4G-Hub-macOS-arm64-native-backend
 ```
 
 输出 `dist/native/DJ 4G Hub.app`。目标已存在时不会覆盖，可用第二个参数指定新的绝对 `.app` 路径。应用仅本地 ad-hoc 签名，未公证，不代表可对外正式发行。

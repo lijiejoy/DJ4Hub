@@ -5,6 +5,11 @@ EG25-G. It does not require UTM for AT-mode management.
 
 ## Current scope
 
+For the consolidated menu-bar application, use `make app` or
+`make package-app VERSION=v1.1.0`. See [the maintenance guide](docs/github-maintenance.md)
+for prerequisites and testing. The portable terminal ZIP described below is the
+legacy arm64 CLI package; it does not bundle ADB or the Swift menu-bar app.
+
 - Automatic discovery of DJI (`2ca3`) and Quectel (`2c7c`) USB serial ports
 - Modem, SIM, operator, registration and signal status
 - Receive and send SMS through the modem AT port
@@ -38,8 +43,12 @@ terminal in the same directory. Logs are stored in
 
 Requirements:
 
-- macOS 13 or newer
-- Go 1.26 or newer
+- Go at the version required by `go.mod`, Xcode Command Line Tools, libusb
+  and pkg-config
+- For the complete app: ADB with its NOTICE, ripgrep, and a supported native Mac
+  build environment. The app detects the minimum OS required by its actual
+  bundled binaries; the Intel development build currently requires macOS 15.
+- The legacy arm64 CLI script below targets macOS 13.
 
 ```sh
 ./scripts/package-macos-arm64.sh v0.1.0-preview

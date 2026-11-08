@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleExecutable</key><string>DJ4HubClient</string>
+    <key>CFBundleIdentifier</key><string>com.dj4hub.client</string>
+    <key>CFBundleName</key><string>DJ 4G Hub</string>
+    <key>CFBundleDisplayName</key><string>DJ 4G Hub</string>
+    <key>CFBundlePackageType</key><string>APPL</string>
+    <key>CFBundleIconFile</key><string>DJ4Hub</string>
+    <key>CFBundleShortVersionString</key><string>1.1.0</string>
+    <key>CFBundleVersion</key><string>1.1.0</string>
+    <key>LSMinimumSystemVersion</key><string>13.0</string>
+    <key>LSUIElement</key><true/>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>DJ 4G Hub 需要使用麦克风，让你通过电脑拨打和接听电话。</string>
+</dict>
+</plist>

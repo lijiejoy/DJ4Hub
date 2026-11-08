@@ -107,7 +107,7 @@ func (a *app) initHistory() error {
 	return nil
 }
 
-func (a *app) historyStore() *communicationHistory {
+func (a *app) communicationHistoryStore() *communicationHistory {
 	a.historyMu.Lock()
 	defer a.historyMu.Unlock()
 	return a.history
@@ -137,7 +137,7 @@ func confirmedHistoryIdentity(before string, after string) string {
 }
 
 func (a *app) historyIdentity() string {
-	if a.historyStore() == nil {
+	if a.communicationHistoryStore() == nil {
 		return ""
 	}
 	if a.demo {
@@ -164,7 +164,7 @@ func parseHistoryICCID(raw string) string {
 }
 
 func (a *app) appendHistory(record historyRecord) error {
-	h := a.historyStore()
+	h := a.communicationHistoryStore()
 	if h == nil {
 		return nil
 	}
@@ -295,7 +295,7 @@ func (a *app) monitorCallHistory(ctx context.Context) {
 			identity := a.historyIdentity()
 			raw, err := a.phoneCommand("AT+CLCC")
 			after := a.historyIdentity()
-			h := a.historyStore()
+			h := a.communicationHistoryStore()
 			if h == nil {
 				a.audioMu.Unlock()
 				continue
@@ -316,7 +316,7 @@ func (a *app) monitorCallHistory(ctx context.Context) {
 }
 
 func (a *app) listHistory(w http.ResponseWriter, r *http.Request) {
-	h := a.historyStore()
+	h := a.communicationHistoryStore()
 	if h == nil {
 		writeError(w, 503, "记录存储未初始化")
 		return

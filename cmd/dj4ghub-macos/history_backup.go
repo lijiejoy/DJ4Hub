@@ -270,7 +270,7 @@ func (a *app) monitorHistoryBackup(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			h := a.historyStore()
+			h := a.communicationHistoryStore()
 			if h == nil || a.demo {
 				continue
 			}
@@ -298,7 +298,7 @@ func (h *communicationHistory) backupIfDue(now time.Time) {
 }
 
 func (a *app) historyBackupStatus(w http.ResponseWriter, r *http.Request) {
-	h := a.historyStore()
+	h := a.communicationHistoryStore()
 	if h == nil {
 		writeError(w, 503, "记录存储未初始化")
 		return
@@ -324,7 +324,7 @@ func (a *app) historyBackupAction(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "无效请求")
 		return
 	}
-	h := a.historyStore()
+	h := a.communicationHistoryStore()
 	if h == nil || a.demo {
 		writeError(w, 503, "真实记录存储不可用")
 		return

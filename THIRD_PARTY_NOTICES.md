@@ -8,11 +8,13 @@ Required Notice: Copyright iniwex5 (https://github.com/iniwex5/vohive)
 
 ## Release Runtime
 
-The macOS release package includes **libusb 1.0.30**, distributed under the GNU Lesser General Public License, version 2.1 or later.
+The legacy arm64 CLI package includes **libusb 1.0.30**, distributed under the GNU Lesser General Public License, version 2.1 or later. The complete App bundles the libusb installed on its build host; its actual version is recorded in `Contents/Resources/BuildInfo.plist`.
 
 - Project: <https://libusb.info/>
 - Source: <https://github.com/libusb/libusb/releases/tag/v1.0.30>
-- License text in the release package: `licenses/libusb-COPYING`
+- License text in the CLI package: `licenses/libusb-COPYING`; in the App: `Contents/Resources/licenses/libusb-COPYING`
+
+The complete App also bundles ADB from Android platform-tools. Its corresponding NOTICE is retained at `Contents/Resources/licenses/platform-tools-NOTICE.txt`. Module-side voice runtime downloads are separate from the App bundle.
 
 ## Vendored Source Dependencies
 
@@ -30,3 +32,5 @@ The source repository includes vendored dependencies under `third_party/` so the
 | multierr | `third_party/multierr/LICENSE.txt` |
 
 Dependencies fetched through Go modules retain their own licenses and copyright notices. This file is informational and does not replace any component's full license text.
+
+The complete App build copies root LICENSE/COPYING/NOTICE files from the Go modules selected by the macOS service dependency graph into `Contents/Resources/licenses/go/`, in addition to this notice and the project's license.

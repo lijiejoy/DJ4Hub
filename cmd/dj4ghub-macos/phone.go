@@ -138,7 +138,7 @@ func (a *app) callAction(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *app) captureCallHistory(identity string) {
-	h := a.historyStore()
+	h := a.communicationHistoryStore()
 	if h == nil {
 		return
 	}

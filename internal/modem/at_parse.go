@@ -216,7 +216,31 @@ type ServingCellLTEInfo struct {
 	SINR    int
 	Duplex  string
 	Band    string
-	Channel uint32
+	Channel uint32 // EARFCN（与 EARFCN 同值，保留旧字段名兼容）
+	EARFCN  uint32
+	PCI     int
+	CellID  string
+}
+
+// ParseServingCellLTEInfo is the exported form of parseServingCellLTEInfo,
+// for the USB-AT path in cmd/dj4ghub-macos (which has no Manager).
+func ParseServingCellLTEInfo(resp string) (ServingCellLTEInfo, bool) {
+	return parseServingCellLTEInfo(resp)
+}
+
+// ParseQIMSStatus is the exported form of parseQIMS, for the USB-AT path.
+func ParseQIMSStatus(resp string) (int, bool) {
+	return parseQIMS(resp)
+}
+
+// ParseCOPSSelection is the exported form of parseCOPSSelection.
+func ParseCOPSSelection(resp string) (OperatorSelectionState, bool) {
+	return parseCOPSSelection(resp)
+}
+
+// ParseCOPSScan is the exported form of parseCOPSScan.
+func ParseCOPSScan(resp string) []OperatorScanEntry {
+	return parseCOPSScan(resp)
 }
 
 func parseServingCellLTE(resp string) (int, int, bool) {
@@ -241,8 +265,18 @@ func parseServingCellLTEInfo(resp string) (ServingCellLTEInfo, bool) {
 	if len(parts) > 3 {
 		info.Duplex = strings.Trim(strings.TrimSpace(parts[3]), "\"")
 	}
+	// +QENG "servingcell" LTE: ... <cellid>,<pcid>,<earfcn>,<freq_band_ind>,...
+	if len(parts) > 6 {
+		info.CellID = strings.TrimSpace(parts[6])
+	}
+	if len(parts) > 7 {
+		if pci, err := strconv.Atoi(strings.TrimSpace(parts[7])); err == nil {
+			info.PCI = pci
+		}
+	}
 	if channel, err := strconv.ParseUint(strings.TrimSpace(parts[8]), 10, 32); err == nil {
 		info.Channel = uint32(channel)
+		info.EARFCN = uint32(channel)
 	}
 	band := strings.TrimSpace(parts[9])
 	if band != "" {
@@ -454,6 +488,10 @@ func parseCNUM(resp string) string {
 	}
 	return ""
 }
+
+// ParseCNUM 是 parseCNUM 的导出包装，供连接层（USB-AT 路径）在不重复
+// 实现 CNUM 解析的情况下复用同一份解析逻辑。
+func ParseCNUM(resp string) string { return parseCNUM(resp) }
 
 // ParseMSISDNResponse 解析 AT+CNUM 响应并返回第一个有效本机号码。
 // internal/modem 之外的 USB AT 适配层使用此入口保持号码校验一致。
