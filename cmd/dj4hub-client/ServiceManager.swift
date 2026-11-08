@@ -26,10 +26,11 @@ final class ServiceManager {
     let request: (URL) throws -> Data
     let readyTimeout: TimeInterval
     private let files = FileManager.default
-    private lazy var helperHash: String? = {
+    // The helper can be replaced while the status-bar client stays running.
+    private var helperHash: String? {
         guard let data = try? Data(contentsOf: helper, options: .mappedIfSafe) else { return nil }
         return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
-    }()
+    }
 
     init(home: URL = FileManager.default.homeDirectoryForCurrentUser,
          bundle: URL = Bundle.main.bundleURL,

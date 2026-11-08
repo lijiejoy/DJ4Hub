@@ -93,6 +93,10 @@ do {
     let starts = fresh.commands.filter { $0[0] == "bootstrap" }.count
     try fresh.manager.ensureStarted()
     expect(fresh.commands.filter { $0[0] == "bootstrap" }.count == starts, "reopen must not restart healthy service")
+    try Data("updated helper on disk".utf8).write(to: fresh.manager.helper)
+    try fresh.manager.ensureStarted()
+    expect(fresh.commands.filter { $0[0] == "bootstrap" }.count == starts,
+           "manager must accept the current helper after it is replaced while the client remains open")
     fresh.reportedHash = "old binary still in memory"
     try fresh.manager.ensureStarted()
     expect(fresh.commands.filter { $0[0] == "bootstrap" }.count == starts + 1, "app update must replace old running code")
