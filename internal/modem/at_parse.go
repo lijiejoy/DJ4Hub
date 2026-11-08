@@ -489,6 +489,10 @@ func parseCNUM(resp string) string {
 	return ""
 }
 
+// ParseCNUM 是 parseCNUM 的导出包装，供连接层（USB-AT 路径）在不重复
+// 实现 CNUM 解析的情况下复用同一份解析逻辑。
+func ParseCNUM(resp string) string { return parseCNUM(resp) }
+
 func canonicalPhoneCandidate(v string) string {
 	s := strings.TrimSpace(v)
 	if s == "" {

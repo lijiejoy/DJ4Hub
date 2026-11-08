@@ -44,3 +44,13 @@ func TestParseCNUM(t *testing.T) {
 		})
 	}
 }
+
+func TestParseCNUMExportedMatchesInternal(t *testing.T) {
+	resp := "\r\n+CNUM: \"My Number\",\"+8613800138000\",145\r\n\r\nOK\r\n"
+	if got := ParseCNUM(resp); got != "+8613800138000" {
+		t.Fatalf("ParseCNUM()=%q want %q", got, "+8613800138000")
+	}
+	if got := ParseCNUM("\r\nOK\r\n"); got != "" {
+		t.Fatalf("ParseCNUM()=%q want empty", got)
+	}
+}

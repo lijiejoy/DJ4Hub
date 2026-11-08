@@ -45,6 +45,7 @@ func (a *app) status(w http.ResponseWriter, _ *http.Request) {
 		if a.usbAT != nil {
 			status, err := a.usbATStatus()
 			if err == nil {
+				a.noteDeviceStatusForSubscription(status.ICCID, usbDeviceFingerprint(a.usbDevice))
 				writeJSON(w, http.StatusOK, status)
 				return
 			}
@@ -71,7 +72,9 @@ func (a *app) status(w http.ResponseWriter, _ *http.Request) {
 		})
 		return
 	}
-	writeJSON(w, http.StatusOK, a.modem.GetFullStatus())
+	fullStatus := a.modem.GetFullStatus()
+	a.noteDeviceStatusForSubscription(fullStatus.ICCID, usbDeviceFingerprint(a.usbDevice))
+	writeJSON(w, http.StatusOK, fullStatus)
 }
 
 func (a *app) currentUSBDevice() *usbDeviceStatus {

@@ -209,3 +209,12 @@ func usbSpeedName(speed int) string {
 		return fmt.Sprintf("speed-%d", speed)
 	}
 }
+
+// usbDeviceFingerprint 是 USB 设备的稳定指纹（厂商/产品/位置），
+// 订阅缓存用它检测换模块/重枚举；位置变化即视为设备可能已更换。
+func usbDeviceFingerprint(d *usbDeviceStatus) string {
+	if d == nil {
+		return ""
+	}
+	return d.VendorID + ":" + d.ProductID + ":" + d.LocationID
+}
