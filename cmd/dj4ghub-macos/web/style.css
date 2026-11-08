@@ -92,10 +92,10 @@
 * { box-sizing: border-box; }
 html { min-width: 320px; background: var(--canvas); }
 body { min-width: 320px; min-height: 100vh; margin: 0; background: var(--canvas); color: var(--text); }
-button, input, textarea { font: inherit; }
+button, input, textarea, select { font: inherit; }
 button { cursor: pointer; }
 button:disabled { cursor: not-allowed; opacity: .48; }
-button:focus-visible, input:focus-visible, textarea:focus-visible, summary:focus-visible { outline: 2px solid color-mix(in srgb, var(--accent) 48%, transparent); outline-offset: 2px; }
+button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible, summary:focus-visible { outline: 2px solid color-mix(in srgb, var(--accent) 48%, transparent); outline-offset: 2px; }
 svg { display: block; }
 
 .app-shell { min-height: 100vh; }
@@ -322,6 +322,21 @@ input::placeholder { color: var(--dim); }
 input:focus { border-color: color-mix(in srgb, var(--accent) 50%, var(--line)); }
 .toolbar button { align-self: end; min-height: 36px; }
 
+:is(#radio, #tasks, #notify) .message-composer { display: grid; gap: 10px; margin: 12px 0; overflow: visible; border: 0; border-radius: 0; background: transparent; }
+:is(#radio, #tasks, #notify) .message-composer[hidden] { display: none; }
+:is(#radio, #tasks, #notify) .message-composer:focus-within { box-shadow: none; }
+.composer-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; min-width: 0; }
+.composer-row > input:not([type="checkbox"]), .composer-row > select { flex: 1 1 170px; }
+.composer-row > [hidden] { display: none; }
+.composer-row > button { flex: 0 0 auto; min-height: 36px; }
+.composer-row > label { display: inline-flex; align-items: center; gap: 6px; min-height: 36px; color: var(--muted); font-size: 12px; }
+.composer-row input[type="checkbox"] { width: 16px; height: 16px; margin: 0; padding: 0; accent-color: var(--accent); }
+.composer-row select { min-width: 0; max-width: 100%; height: 36px; border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 0 9px; background: var(--field); color: var(--text-default); font-size: 12px; }
+.list-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; padding: 12px 14px; border-bottom: 1px solid var(--line); font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
+.list-row:last-child { border-bottom: 0; }
+:is(#serving-cell, #gnss-detail):not(.empty) { padding: 12px 14px; font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; white-space: pre-wrap; }
+#modules-list .item { display: block; font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
+
 .section-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 18px; margin: 28px 0 9px; }
 .section-heading h2 { margin: 0; color: var(--text-default); font-size: 12px; font-weight: 550; }
 .section-heading p { margin: 4px 0 0; color: var(--dim); font-size: 9px; }
@@ -544,3 +559,34 @@ body.modal-open { overflow: hidden; }
   .status-grid > div.status-primary { min-height: 78px; }
   .status-grid strong { font-size: 14px; }
 }
+
+.sip-settings-form { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.sip-settings-form label { display: grid; gap: 4px; color: var(--muted); font-size: 10px; }
+.sip-settings-form select { width: 100%; height: 36px; border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 0 11px; background: var(--field); color: var(--text-default); font-size: 11px; }
+.sip-settings-form .full { grid-column: 1 / -1; }
+.sip-call-actions { margin-top: 12px; }
+
+.incoming-call { box-sizing: border-box; width: min(440px, calc(100vw - 32px)); max-height: calc(100dvh - 32px); overflow-y: auto; border: 1px solid var(--line); border-radius: 8px; padding: 28px 32px 36px; background: var(--surface-raised); color: var(--text); text-align: center; box-shadow: 0 24px 80px rgba(0,0,0,.28); }
+.incoming-call::backdrop { background: rgba(0,0,0,.65); backdrop-filter: blur(8px); }
+.call-symbols { position: absolute; width: 0; height: 0; }
+.incoming-call-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; font-size: 15px; }
+.call-mute { min-height: 32px; font-size: 12px; }
+.call-avatar { display: grid; place-items: center; width: 96px; height: 96px; margin: 36px auto 28px; border-radius: 50%; color: var(--positive); background: var(--positive-soft); }
+.call-avatar svg { width: 42px; height: 42px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linejoin: round; stroke-linecap: round; }
+.incoming-call[data-state="ringing"] .call-avatar { animation: call-ring 1.7s ease-in-out infinite; }
+.incoming-call h2 { margin: 0; font-size: 28px; line-height: 1.35; overflow-wrap: anywhere; font-weight: 600; letter-spacing: 0; }
+#incoming-call-state { min-height: 24px; margin: 12px 0 0; font-size: 14px; color: var(--muted); }
+.call-error { color: var(--negative); font-size: 13px; overflow-wrap: anywhere; }
+.incoming-call-actions { display: flex; justify-content: space-evenly; gap: 36px; margin-top: 48px; }
+.call-action { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 7px; width: 84px; height: 84px; padding: 12px; border: 0; border-radius: 50%; color: #fff; font-size: 13px; flex: 0 0 auto; }
+.call-action svg { width: 26px; height: 26px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linejoin: round; stroke-linecap: round; }
+.call-answer, .call-answer:hover { background: #16835a; }
+.call-reject, .call-reject:hover { background: #c43d4f; }
+.call-reject svg { transform: rotate(135deg); }
+.call-action:focus-visible { outline: 3px solid var(--text); outline-offset: 5px; }
+.call-action:disabled { opacity: .55; cursor: wait; }
+.incoming-call [hidden] { display: none; }
+@keyframes call-ring { 0%,100% { transform: rotate(0deg); } 10%,30% { transform: rotate(-8deg); } 20%,40% { transform: rotate(8deg); } 50% { transform: rotate(0deg); } }
+@media (max-width: 480px) { .incoming-call { padding: 22px 22px 30px; } .incoming-call h2 { font-size: 24px; } .call-avatar { margin-top: 28px; } }
+@media (prefers-reduced-motion: reduce) { .incoming-call .call-avatar { animation: none; } }
+.panel-icon svg { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.7; }
