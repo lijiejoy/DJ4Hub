@@ -1743,6 +1743,210 @@ $("#sip-settings-form").addEventListener("submit", async (event) => {
   }
 });
 
+/* delivery-3: 最近通话（持久化历史）——列表复用 GET /api/history/calls；
+   回拨走 POST /api/calls/redial（内部转调原有 /api/sip/call），
+   发短信走 POST /api/calls/sms（内部转调原有 /api/sms/send），
+   保存联系人走 POST /api/calls/save-contact；未接角标来自
+   GET /api/calls/missed-count，列表成功渲染后调
+   POST /api/calls/missed/seen 清零。 */
+let recentCallsState = { scope: "all", direction: "", subscription: "", offset: 0, total: 0, loading: false };
+let recentContactsByNormalized = new Map();
+
+async function loadRecentContacts() {
+  try {
+    const data = await api("/api/contacts");
+    recentContactsByNormalized = new Map();
+    for (const contact of data.items || []) {
+      for (const normalized of contact.normalized || []) recentContactsByNormalized.set(normalized, contact);
+    }
+  } catch (error) {
+    // 联系人名解析失败不阻塞通话列表，只显示原始号码。
+  }
+}
+
+function recentCallContactName(call) {
+  const contact = recentContactsByNormalized.get(call.number_normalized || "");
+  return contact ? contact.name : "";
+}
+
+async function refreshMissedBadge() {
+  const badge = $("#calls-missed-badge");
+  if (!badge) return;
+  try {
+    const data = await api("/api/calls/missed-count");
+    const unseen = Number(data.missed_unseen) || 0;
+    badge.textContent = unseen > 99 ? "99+" : String(unseen);
+    badge.hidden = unseen <= 0;
+  } catch (error) {
+    badge.hidden = true;
+  }
+}
+
+function recentCallsQuery() {
+  const params = new URLSearchParams({ limit: "50", offset: String(recentCallsState.offset) });
+  if (recentCallsState.scope === "missed") params.set("missed", "true");
+  if (recentCallsState.direction) params.set("direction", recentCallsState.direction);
+  if (recentCallsState.subscription) params.set("subscription_id", recentCallsState.subscription);
+  return `/api/history/calls?${params.toString()}`;
+}
+
+function recentCallsSubscriptionOptions(items) {
+  const select = $("#recent-calls-subscription");
+  const previous = select.value;
+  const seen = new Map();
+  for (const item of items) {
+    if (!item.subscription_id || seen.has(item.subscription_id)) continue;
+    seen.set(item.subscription_id, item.iccid_masked || item.subscription_id);
+  }
+  while (select.options.length > 1) select.remove(1);
+  for (const [value, label] of seen.entries()) {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = value === "unknown" ? "归属未知" : `卡 ${label}`;
+    select.append(option);
+  }
+  if (previous && seen.has(previous)) select.value = previous;
+  else {
+    select.value = "";
+    recentCallsState.subscription = "";
+  }
+}
+
+function recentCallRow(call) {
+  const row = document.createElement("article");
+  row.className = "item";
+  const title = document.createElement("strong");
+  const name = recentCallContactName(call);
+  title.textContent = name ? `${name} · ${call.number}` : call.number;
+  const meta = document.createElement("p");
+  const direction = call.direction === "inbound" ? "呼入" : "呼出";
+  const when = new Date(call.started_at).toLocaleString();
+  const duration = call.duration_seconds ? ` · ${formatCallDuration(call.duration_seconds)}` : "";
+  const reason = call.end_reason_label ? ` · ${call.end_reason_label}` : "";
+  const missed = call.missed ? " · 未接" : "";
+  const card = call.attribution_unknown ? " · 归属未知" : (call.iccid_masked ? ` · 卡 ${call.iccid_masked}` : "");
+  meta.textContent = `${direction}${missed} · ${when}${duration}${reason}${card}`;
+  const actions = document.createElement("div");
+  actions.className = "sms-actions";
+  const redial = document.createElement("button");
+  redial.className = "secondary compact";
+  redial.type = "button";
+  redial.textContent = "回拨";
+  redial.addEventListener("click", () => void redialRecentCall(call));
+  const sms = document.createElement("button");
+  sms.className = "secondary compact";
+  sms.type = "button";
+  sms.textContent = "发短信";
+  sms.addEventListener("click", () => void smsRecentCall(call));
+  const save = document.createElement("button");
+  save.className = "secondary compact";
+  save.type = "button";
+  save.textContent = "保存联系人";
+  save.addEventListener("click", () => void saveRecentCallContact(call));
+  actions.append(redial, sms, save);
+  row.append(title, meta, actions);
+  return row;
+}
+
+async function redialRecentCall(call) {
+  try {
+    await api("/api/calls/redial", { method: "POST", body: JSON.stringify({ call_id: call.id }) });
+    notice(`已发起回拨：${call.number}`);
+    await loadSIP();
+    await loadRecentCalls();
+  } catch (error) {
+    notice(error.message);
+  }
+}
+
+async function smsRecentCall(call) {
+  const values = await showModal({
+    title: `发短信给 ${call.number}`,
+    message: "经已有短信发送通道发出，发送结果记入发件箱。",
+    confirmLabel: "发送",
+    fields: [{ name: "message", label: "短信内容", value: "", placeholder: "输入短信内容", required: true }],
+  });
+  if (!values || !values.message) return;
+  try {
+    await api("/api/calls/sms", { method: "POST", body: JSON.stringify({ call_id: call.id, message: values.message }) });
+    notice("短信已发送");
+    await loadSMS();
+  } catch (error) {
+    notice(error.message);
+  }
+}
+
+async function saveRecentCallContact(call) {
+  const existing = recentContactsByNormalized.get(call.number_normalized || "");
+  const values = await showModal({
+    title: "保存联系人",
+    message: `号码 ${call.number} 将保存在本地联系人中，来电与通话记录会显示该姓名。`,
+    confirmLabel: "保存",
+    fields: [{ name: "name", label: "姓名", value: existing ? existing.name : "", placeholder: "例如：张三", required: true }],
+  });
+  if (!values || !values.name) return;
+  try {
+    await api("/api/calls/save-contact", { method: "POST", body: JSON.stringify({ call_id: call.id, name: values.name }) });
+    notice("联系人已保存");
+    await loadRecentContacts();
+    await loadRecentCalls();
+  } catch (error) {
+    notice(error.message);
+  }
+}
+
+async function loadRecentCalls(reset = true) {
+  if (recentCallsState.loading) return;
+  recentCallsState.loading = true;
+  const list = $("#recent-calls-list");
+  const status = $("#recent-calls-status");
+  const more = $("#recent-calls-more");
+  try {
+    if (reset) recentCallsState.offset = 0;
+    await loadRecentContacts();
+    const data = await api(recentCallsQuery());
+    const items = data.items || [];
+    recentCallsState.total = data.total || 0;
+    recentCallsState.offset += items.length;
+    recentCallsSubscriptionOptions(items);
+    if (reset) list.replaceChildren();
+    if (!items.length && reset) {
+      list.className = "list empty";
+      list.textContent = "暂无通话记录";
+    } else {
+      list.classList.remove("empty");
+      list.append(...items.map((call) => recentCallRow(call)));
+    }
+    const shown = list.querySelectorAll(".item").length;
+    status.textContent = `共 ${recentCallsState.total} 条通话记录 · 已显示 ${shown} 条`;
+    more.hidden = shown >= recentCallsState.total || recentCallsState.total === 0;
+    // 用户已看到本页未接记录，清零角标；失败不阻塞列表展示。
+    try {
+      await api("/api/calls/missed/seen", { method: "POST", body: JSON.stringify({}) });
+      await refreshMissedBadge();
+    } catch (error) { /* 角标下次刷新时再清 */ }
+  } catch (error) {
+    status.textContent = `读取通话记录失败：${error.message}`;
+    notice(error.message);
+  } finally {
+    recentCallsState.loading = false;
+  }
+}
+
+$("#recent-calls-scope").addEventListener("change", (event) => {
+  recentCallsState.scope = event.currentTarget.value;
+  void loadRecentCalls();
+});
+$("#recent-calls-direction").addEventListener("change", (event) => {
+  recentCallsState.direction = event.currentTarget.value;
+  void loadRecentCalls();
+});
+$("#recent-calls-subscription").addEventListener("change", (event) => {
+  recentCallsState.subscription = event.currentTarget.value;
+  void loadRecentCalls();
+});
+$("#recent-calls-refresh").addEventListener("click", () => void loadRecentCalls());
+$("#recent-calls-more").addEventListener("click", () => void loadRecentCalls(false));
 
 document.querySelectorAll(".tab").forEach((tab) => {
   tab.addEventListener("click", () => {
@@ -1757,7 +1961,7 @@ document.querySelectorAll(".tab").forEach((tab) => {
     setNetworkActivityPolling(tab.dataset.view === "overview");
     if (tab.dataset.view === "esim") loadESIM();
     else setESIMHealthPolling(false);
-    if (tab.dataset.view === "calls") { void loadSIP(); void loadSipAudioDevices(); }
+    if (tab.dataset.view === "calls") { void loadSIP(); void loadSipAudioDevices(); void loadRecentCalls(); }
     if (tab.dataset.view === "tasks") void loadTasks();
     if (tab.dataset.view === "notify") void loadNotify();
     if (tab.dataset.view === "radio") setRadioPolling(true);
@@ -2402,12 +2606,14 @@ loadStatus();
 loadStatus();
 loadSubscription();
 loadSMS();
+refreshMissedBadge();
 loadSidebarConnection();
 setSIPPolling();
 setNetworkTrafficPolling(true);
 setNetworkActivityPolling(true);
 setInterval(loadStatus, 10000);
 setInterval(loadSMS, 5000);
+setInterval(refreshMissedBadge, 30000);
 setInterval(loadSidebarConnection, 10000);
 
 // --- Notifications (Batch 1) ---------------------------------------------

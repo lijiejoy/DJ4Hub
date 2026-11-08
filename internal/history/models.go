@@ -100,9 +100,13 @@ type CallRecord struct {
 	EndReason       string
 	EndState        string // 终结时的通话状态：ended/failed/missed。
 	Missed          bool
-	Status          string // active/ended/interrupted。
-	CreatedAt       time.Time
-	UpdatedAt       time.Time
+	// Seen 表示用户是否已在“最近通话”里看到这条未接来电（交付点 3
+	// 的角标依据）。只有未接（Missed）才可能为 false；已接通的通话
+	// 写入时即为已读。升级前已存在的未接默认已读，避免旧记录点亮角标。
+	Seen      bool
+	Status    string // active/ended/interrupted。
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }
 
 // OutboxAttempt 是一次发送尝试。Status 与 ErrorText 一起说明结果；

@@ -61,6 +61,7 @@ type callRow struct {
 	EndReason        string `gorm:"column:end_reason"`
 	EndState         string `gorm:"column:end_state"`
 	Missed           int64  `gorm:"column:missed"`
+	Seen             int64  `gorm:"column:seen"`
 	Status           string `gorm:"column:status"`
 	CreatedAt        int64  `gorm:"column:created_at"`
 	UpdatedAt        int64  `gorm:"column:updated_at"`
@@ -137,6 +138,7 @@ func (r callRow) toRecord() CallRecord {
 		EndReason:       r.EndReason,
 		EndState:        r.EndState,
 		Missed:          r.Missed != 0,
+		Seen:            r.Seen != 0,
 		Status:          r.Status,
 		CreatedAt:       fromMillisValue(r.CreatedAt),
 		UpdatedAt:       fromMillisValue(r.UpdatedAt),
@@ -536,6 +538,7 @@ func (s *Store) UpsertCall(ctx context.Context, rec CallRecord) error {
 					updates["end_reason"] = rec.EndReason
 				}
 				updates["missed"] = boolToInt(rec.Missed)
+				updates["seen"] = boolToInt(!rec.Missed)
 				if rec.DurationSeconds != nil {
 					updates["duration_seconds"] = *rec.DurationSeconds
 				}
@@ -572,6 +575,7 @@ func (s *Store) UpsertCall(ctx context.Context, rec CallRecord) error {
 			"end_reason":       endReason,
 			"end_state":        rec.EndState,
 			"missed":           boolToInt(rec.Missed),
+			"seen":             boolToInt(!rec.Missed),
 			"status":           status,
 			"created_at":       now, "updated_at": now,
 		}
