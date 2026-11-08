@@ -131,7 +131,13 @@
           <div class="status-primary"><span>运营商</span><strong id="operator">--</strong><small>蜂窝网络</small></div>
           <div class="status-primary"><span>信号</span><strong id="signal">--</strong><small>接收强度</small></div>
           <div class="status-primary"><span>网络</span><strong id="network-mode">--</strong><small>注册制式</small></div>
-          <div class="status-primary"><span>SIM</span><strong id="sim">--</strong><small>卡片状态</small></div>
+          <div class="status-primary">
+            <span>SIM</span><strong id="sim">--</strong><small id="sim-phone-empty">卡片状态</small>
+            <div id="sim-phone-actions" class="sim-phone-actions" hidden>
+              <button id="sim-phone-toggle" type="button">--</button>
+              <button id="sim-phone-copy" type="button">复制</button>
+            </div>
+          </div>
           <div class="status-primary"><span>工作模式</span><strong id="work-mode">--</strong><small>USBNET</small></div>
           <div><span>实时下载</span><strong id="traffic-rx-rate">--</strong></div>
           <div><span>实时上传</span><strong id="traffic-tx-rate">--</strong></div>
@@ -352,6 +358,11 @@
             <button id="refresh-esim" class="secondary" type="button">刷新卡片</button>
           </div>
         </div>
+        <div id="esim-card-state" class="esim-card-state">
+          <span class="esim-card-state-mark" aria-hidden="true"></span>
+          <strong id="esim-card-state-title">准备读取卡片</strong>
+          <p id="esim-card-state-detail">正在确认当前卡片是否支持 eUICC Profile 管理。</p>
+        </div>
         <details id="esim-download-section" class="fold-panel esim-download">
           <summary><span><span class="panel-icon" aria-hidden="true">↓</span><strong>下载新 Profile</strong></span><small>SM-DP+ 激活信息</small></summary>
           <form id="esim-download-form" class="esim-download-grid">
@@ -401,6 +412,13 @@
         </div>
         <div id="network-grid" class="network-summary"></div>
 
+        <div id="network-recovery" class="network-recovery" hidden>
+          <div>
+            <strong id="network-recovery-title">macOS 网络服务需要处理</strong>
+            <p id="network-recovery-detail">启用当前 USB 网卡服务并重新请求 DHCP 地址。</p>
+          </div>
+          <button id="enable-network-service" type="button">启用网卡</button>
+        </div>
         <div class="settings-section">
           <div class="section-heading"><div><h2>连通性检测</h2><p>确认真实出口与代理链路。</p></div></div>
           <div class="control-panel">
