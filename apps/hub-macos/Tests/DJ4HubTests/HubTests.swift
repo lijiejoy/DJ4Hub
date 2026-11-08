@@ -64,6 +64,21 @@ final class HubTests: XCTestCase {
         history.record(sample(30000, 1000))
         XCTAssertTrue(history.download.isEmpty)
     }
+    func testTrafficHistoryResamplesWhenUSBInstanceChanges() {
+        var history = TrafficHistory()
+        func sample(_ time: Int, _ bytes: Int, _ counterID: String) -> HubValue {
+            HubValue(["available": true, "sampled_at_ms": time, "rx_bytes": bytes,
+                      "tx_bytes": bytes, "interface": "en9", "counter_id": counterID])
+        }
+        history.record(sample(1000, 100, "old"))
+        history.record(sample(2000, 200, "old"))
+        XCTAssertEqual(history.download, [100])
+        history.record(sample(3000, 9000, "new"))
+        XCTAssertTrue(history.download.isEmpty)
+        XCTAssertTrue(history.upload.isEmpty)
+        history.record(sample(4000, 9100, "new"))
+        XCTAssertEqual(history.download, [100])
+    }
     func testAudioRejectsEmptyDevicesWithoutOpeningMicrophone() {
         var error: Int32 = 0
         XCTAssertNil(dj_audio_start("", "", &error))

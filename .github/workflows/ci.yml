@@ -55,3 +55,16 @@ jobs:
         run: make build client
       - name: Embedded web and HTTP smoke test
         run: make test-demo
+      - name: Check scripts
+        run: sh -n packaging/dj4ghub packaging/install scripts/build-macos.sh scripts/package-macos-arm64.sh
+      - name: Test
+        run: go test ./...
+      - name: Test web traffic and phone controls
+        run: node --test scripts/*.test.cjs
+      - name: Test native traffic calculations
+        run: |
+          traffic_check_dir=$(mktemp -d)
+          swiftc apps/hub-macos/Sources/DJ4Hub/Service.swift \
+            apps/hub-macos/Sources/DJ4Hub/TrafficHistory.swift \
+            scripts/test-network-traffic.swift -o "$traffic_check_dir/check-traffic"
+          "$traffic_check_dir/check-traffic"
