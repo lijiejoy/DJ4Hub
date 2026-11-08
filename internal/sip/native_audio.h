@@ -37,6 +37,18 @@ void dj_audio_write(dj_audio *audio, const int16_t *pcm, int count);
 void dj_audio_counters(dj_audio *audio, dj_audio_counts *counts);
 typedef struct dj_local_audio dj_local_audio;
 dj_local_audio *dj_local_audio_open(const char *input_uid, const char *output_uid, int start, dj_audio_devices *devices, char *error, int error_size);
+
+// One Mac audio device that a local call may use. The module's own USB
+// audio engine is never listed here: it is the far end of the call, not a
+// host microphone/speaker choice.
+typedef struct {
+    char name[256];
+    char uid[256];
+    int has_input;
+    int has_output;
+    int transport; // kAudioDeviceTransportType* value, 0 when unreadable
+} dj_local_audio_device;
+int dj_local_audio_list(dj_local_audio_device *devices, int capacity, int *count, char *error, int error_size);
 int dj_local_audio_start(dj_local_audio *audio);
 void dj_local_audio_close(dj_local_audio *audio);
 int dj_local_audio_read(dj_local_audio *audio, int16_t *pcm, int count);

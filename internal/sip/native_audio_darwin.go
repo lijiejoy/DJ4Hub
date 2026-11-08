@@ -24,6 +24,41 @@ func nativeDevices(info *C.dj_audio_devices) audioDevices {
 	}
 }
 
+// AudioDevice is one host audio device a local call may use. UID is the
+// stable selector stored in call-audio.json; Name is for display only.
+// The module's own USB audio engine is never listed.
+type AudioDevice struct {
+	Name      string `json:"name"`
+	UID       string `json:"uid"`
+	HasInput  bool   `json:"has_input"`
+	HasOutput bool   `json:"has_output"`
+	Transport int    `json:"transport,omitempty"`
+}
+
+// ListLocalAudioDevices enumerates host microphones/speakers via CoreAudio.
+// It reads device properties only: no stream is opened and no permission
+// prompt is triggered.
+func ListLocalAudioDevices() ([]AudioDevice, error) {
+	const capacity = 32
+	devices := make([]C.dj_local_audio_device, capacity)
+	var count C.int
+	var message [512]C.char
+	if C.dj_local_audio_list(&devices[0], C.int(capacity), &count, &message[0], C.int(len(message))) != 0 {
+		return nil, errors.New(C.GoString(&message[0]))
+	}
+	out := make([]AudioDevice, 0, int(count))
+	for i := 0; i < int(count); i++ {
+		out = append(out, AudioDevice{
+			Name:      C.GoString(&devices[i].name[0]),
+			UID:       C.GoString(&devices[i].uid[0]),
+			HasInput:  devices[i].has_input != 0,
+			HasOutput: devices[i].has_output != 0,
+			Transport: int(devices[i].transport),
+		})
+	}
+	return out, nil
+}
+
 func probeNativeAudio() (audioDevices, error) {
 	var info C.dj_audio_devices
 	var message [512]C.char

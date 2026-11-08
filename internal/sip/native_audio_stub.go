@@ -10,6 +10,10 @@ func nativeRequestAudioPermission() error {
 	return errors.New("microphone authorization requires macOS with cgo enabled")
 }
 
+func ListLocalAudioDevices() ([]AudioDevice, error) {
+	return nil, errors.New("listing local audio devices requires macOS with cgo enabled")
+}
+
 func probeNativeAudio() (audioDevices, error) {
 	return audioDevices{}, errors.New("module USB audio requires macOS with cgo enabled")
 }

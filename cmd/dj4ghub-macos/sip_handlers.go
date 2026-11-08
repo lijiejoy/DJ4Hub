@@ -470,6 +470,82 @@ func (a *app) sipAnswer(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
+// sipDTMF sends one DTMF digit on a connected call (AT+VTS via the
+// modem). The native panel already had this path; the web UI had none.
+func (a *app) sipDTMF(w http.ResponseWriter, r *http.Request) {
+	if a.sip == nil {
+		writeError(w, http.StatusServiceUnavailable, "SIP server not started")
+		return
+	}
+	var body struct {
+		CallID string `json:"call_id"`
+		Digit  string `json:"digit"`
+	}
+	if !decodeJSON(w, r, &body) {
+		return
+	}
+	if err := a.sip.SendDTMF(body.CallID, body.Digit); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// sipAudioControls sets the local microphone/speaker mute for one call.
+// Same control the native panel sends; now reachable from the web UI.
+func (a *app) sipAudioControls(w http.ResponseWriter, r *http.Request) {
+	if a.sipAudio == nil {
+		writeError(w, http.StatusServiceUnavailable, "local call audio unavailable")
+		return
+	}
+	var body struct {
+		CallID          string `json:"call_id"`
+		MicrophoneMuted bool   `json:"microphone_muted"`
+		SpeakerMuted    bool   `json:"speaker_muted"`
+	}
+	if !decodeJSON(w, r, &body) {
+		return
+	}
+	if err := a.sipAudio.SetLocalControls(body.CallID, body.MicrophoneMuted, body.SpeakerMuted); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// sipAudioDevices lists host audio devices and persists the selection for
+// the next call. GET returns the list plus the current selection; POST
+// saves {input, output} (device UID or name; empty resets that side to
+// the built-in default). A selection never touches a running call.
+func (a *app) sipAudioDevices(w http.ResponseWriter, r *http.Request) {
+	if a.sipAudio == nil {
+		writeError(w, http.StatusServiceUnavailable, "local call audio unavailable")
+		return
+	}
+	if r.Method == http.MethodPost {
+		var body struct {
+			Input  string `json:"input"`
+			Output string `json:"output"`
+		}
+		if !decodeJSON(w, r, &body) {
+			return
+		}
+		if err := a.sipAudio.SetAudioDevices(body.Input, body.Output); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+	devices, err := sip.ListLocalAudioDevices()
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
+	input, output := a.sipAudio.AudioDeviceSelection()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"devices": devices, "input": input, "output": output,
+	})
+}
+
 // sipSettingsPublic is the settings view returned to the UI. The password
 // is never returned; only whether one exists.
 type sipSettingsPublic struct {

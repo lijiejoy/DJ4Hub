@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -55,6 +56,99 @@ type CallAudioBridge struct {
 	permission func() error
 	warmCancel context.CancelFunc
 	closed     bool
+	// configDir holds call-audio.json, the persisted local audio device
+	// selection. It is read at each call start, so a selection applies
+	// to the next call, never to a running one.
+	configDir string
+}
+
+// LocalMediaFlowing reports whether the local audio pump for call id is
+// actually moving PCM in either direction. "running" alone only means the
+// pump started; forwarded samples prove audio flowed.
+func (b *CallAudioBridge) LocalMediaFlowing(id string) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if id == "" || id != b.callID || b.local.State != "running" {
+		return false
+	}
+	return b.local.MicForwarded+b.local.RemoteForwarded > 0
+}
+
+// AudioDeviceSelection returns the persisted local input/output device
+// selection (UID or name as stored in call-audio.json). Empty means
+// "built-in default", which is what the audio layer picks when nothing
+// is configured.
+func (b *CallAudioBridge) AudioDeviceSelection() (input, output string) {
+	data, err := os.ReadFile(filepath.Join(b.configDir, "call-audio.json"))
+	if err != nil {
+		return "", ""
+	}
+	var config struct {
+		Input  string `json:"input_device"`
+		Output string `json:"output_device"`
+	}
+	if err := json.Unmarshal(data, &config); err != nil {
+		return "", ""
+	}
+	return config.Input, config.Output
+}
+
+// SetAudioDevices persists the local input/output device choice for the
+// next call. Values are a device UID or name as listed by
+// ListLocalAudioDevices; empty resets that side to the built-in default.
+// A non-empty value that matches no listed device is rejected, so a
+// stale selection can never silently fall back to another device. The
+// choice never touches a running call.
+func (b *CallAudioBridge) SetAudioDevices(input, output string) error {
+	if b.configDir == "" {
+		return errors.New("no config directory for audio device selection")
+	}
+	input = strings.TrimSpace(input)
+	output = strings.TrimSpace(output)
+	if input != "" || output != "" {
+		devices, err := ListLocalAudioDevices()
+		if err != nil {
+			return fmt.Errorf("cannot list audio devices: %w", err)
+		}
+		if input != "" && !audioDeviceMatches(devices, input, true) {
+			return fmt.Errorf("unknown input device %q", input)
+		}
+		if output != "" && !audioDeviceMatches(devices, output, false) {
+			return fmt.Errorf("unknown output device %q", output)
+		}
+	}
+	var existing struct {
+		Enabled *bool  `json:"enabled,omitempty"`
+		Input   string `json:"input_device,omitempty"`
+		Output  string `json:"output_device,omitempty"`
+	}
+	data, err := os.ReadFile(filepath.Join(b.configDir, "call-audio.json"))
+	if err == nil {
+		_ = json.Unmarshal(data, &existing)
+	} else if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	existing.Input, existing.Output = input, output
+	out, err := json.MarshalIndent(existing, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(b.configDir, 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(b.configDir, "call-audio.json"), out, 0o600)
+}
+
+func audioDeviceMatches(devices []AudioDevice, wanted string, wantInput bool) bool {
+	for _, d := range devices {
+		if wantInput && !d.HasInput || !wantInput && !d.HasOutput {
+			continue
+		}
+		if d.UID == wanted || d.Name == wanted {
+			return true
+		}
+	}
+	return false
 }
 
 func NewCallAudioBridge(configDir string) *CallAudioBridge {
@@ -69,7 +163,7 @@ func NewCallAudioBridge(configDir string) *CallAudioBridge {
 		}
 		return open()
 	}
-	bridge := &CallAudioBridge{usbAudioBridge: module, voice: voice, local: LocalAudioStatus{State: "idle"}}
+	bridge := &CallAudioBridge{usbAudioBridge: module, voice: voice, local: LocalAudioStatus{State: "idle"}, configDir: configDir}
 	bridge.permission = ensureMicrophonePermission
 	bridge.warmModule = func(ctx context.Context) error {
 		return voice.prepare(ctx, filepath.Join(configDir, "module-voice"), false)

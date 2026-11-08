@@ -473,6 +473,53 @@ int dj_local_audio_start(dj_local_audio *audio) {
     return result;
 }
 
+// List every host audio device a local call may use as microphone or
+// speaker. Module USB audio engines are skipped: they are the far end of
+// the call, not a host device choice. A device appears once, with input
+// and output stream presence reported separately.
+int dj_local_audio_list(dj_local_audio_device *devices, int capacity, int *count, char *error, int error_size) {
+    *count = 0;
+    if (capacity <= 0) return 0;
+    AudioObjectPropertyAddress address = prop(kAudioHardwarePropertyDevices, kAudioObjectPropertyScopeGlobal);
+    UInt32 bytes = 0;
+    OSStatus status = AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &address, 0, NULL, &bytes);
+    if (status != noErr || bytes == 0) {
+        snprintf(error, error_size, "cannot enumerate CoreAudio devices (OSStatus %d)", (int)status);
+        return -1;
+    }
+    AudioDeviceID *ids = malloc(bytes);
+    if (!ids) { snprintf(error, error_size, "cannot allocate device list"); return -1; }
+    status = AudioObjectGetPropertyData(kAudioObjectSystemObject, &address, 0, NULL, &bytes, ids);
+    if (status != noErr) {
+        free(ids);
+        snprintf(error, error_size, "cannot read CoreAudio devices (OSStatus %d)", (int)status);
+        return -1;
+    }
+    for (UInt32 i = 0; i < bytes / sizeof(*ids) && *count < capacity; i++) {
+        char uid[256] = {0}, prefix[256] = {0};
+        if (!get_string(ids[i], kAudioDevicePropertyDeviceUID, uid, sizeof(uid)) ||
+            module_uid(uid, prefix, sizeof(prefix))) continue;
+        dj_local_audio_device *device = &devices[*count];
+        memset(device, 0, sizeof(*device));
+        get_string(ids[i], kAudioObjectPropertyName, device->name, sizeof(device->name));
+        snprintf(device->uid, sizeof(device->uid), "%s", uid);
+        UInt32 transport = 0, size = sizeof(transport);
+        address = prop(kAudioDevicePropertyTransportType, kAudioObjectPropertyScopeGlobal);
+        if (AudioObjectGetPropertyData(ids[i], &address, 0, NULL, &size, &transport) == noErr) {
+            device->transport = (int)transport;
+        }
+        UInt32 streams = 0;
+        address = prop(kAudioDevicePropertyStreams, kAudioObjectPropertyScopeInput);
+        if (AudioObjectGetPropertyDataSize(ids[i], &address, 0, NULL, &streams) == noErr && streams) device->has_input = 1;
+        address = prop(kAudioDevicePropertyStreams, kAudioObjectPropertyScopeOutput);
+        if (AudioObjectGetPropertyDataSize(ids[i], &address, 0, NULL, &streams) == noErr && streams) device->has_output = 1;
+        if (!device->has_input && !device->has_output) continue;
+        (*count)++;
+    }
+    free(ids);
+    return 0;
+}
+
 dj_local_audio *dj_local_audio_open(const char *input_uid, const char *output_uid, int start, dj_audio_devices *devices, char *error, int error_size) {
     memset(devices, 0, sizeof(*devices));
     devices->input_id = local_device(kAudioObjectPropertyScopeInput, input_uid, devices->input_uid, devices->input_name);

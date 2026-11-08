@@ -53,6 +53,26 @@ type Call struct {
 	ConnectedAt time.Time `json:"connected_at,omitempty"`
 	Error       string    `json:"error,omitempty"`
 
+	// endReason explains a terminal state (see CallEndReason). It stays
+	// empty while the call is live and is never guessed: unknown signals
+	// record EndReasonUnknown.
+	endReason CallEndReason
+	// moduleConnected is set only when the modem confirms the call is
+	// connected (CONNECT URC, ATA success, or an active +CLCC entry).
+	// It is independent of MediaReady below.
+	moduleConnected bool
+	// mediaReady is set once audio is actually flowing (RTP packets in
+	// either direction for a SIP leg, forwarded PCM for a local call).
+	mediaReady   bool
+	mediaReadyAt time.Time
+	// ringAt is when the call entered ringing; with StartedAt and
+	// ConnectedAt it gives the segmented timings in PublicCall.Timings.
+	ringAt time.Time
+	// mediaCheck reports whether media is flowing right now. It is
+	// evaluated outside the call lock (see public) because it reads the
+	// RTP session and the audio bridge.
+	mediaCheck func() bool
+
 	mu            sync.Mutex
 	callID        string // SIP Call-ID of the dialog
 	fromTag       string
@@ -94,6 +114,18 @@ func (c *Call) RTPStats() *RTPSessionStats {
 	return &stats
 }
 
+// CallTimings is the segmented timing record for one call, in
+// milliseconds. Each segment is present only once its endpoints are known,
+// so a report can take medians and worst cases per segment without mixing
+// ring wait into talk time. The values are measured server-side; the native
+// alert's first ring sound is logged separately (see call_alerts.go).
+type CallTimings struct {
+	DialToRingingMs    *int64 `json:"dial_to_ringing_ms,omitempty"`
+	RingToAnswerMs     *int64 `json:"ring_to_answer_ms,omitempty"`
+	AnswerToFirstMedia *int64 `json:"answer_to_first_media_ms,omitempty"`
+	DialToConnectedMs  *int64 `json:"dial_to_connected_ms,omitempty"`
+}
+
 // PublicCall is the JSON view of a Call.
 type PublicCall struct {
 	ID          string           `json:"id"`
@@ -105,19 +137,80 @@ type PublicCall struct {
 	Error       string           `json:"error,omitempty"`
 	RTP         *RTPSessionStats `json:"rtp,omitempty"`
 	LocalAudio  bool             `json:"local_audio"`
+	// EndReason explains a terminal state; empty while the call is live.
+	EndReason CallEndReason `json:"end_reason,omitempty"`
+	// ModuleConnected: the modem confirmed the call is connected.
+	ModuleConnected bool `json:"module_connected"`
+	// MediaReady: audio is actually flowing (RTP packets, or forwarded
+	// PCM on a local call). Independent of ModuleConnected.
+	MediaReady   bool      `json:"media_ready"`
+	MediaReadyAt time.Time `json:"media_ready_at,omitempty"`
+	RingAt       time.Time `json:"ring_at,omitempty"`
+	// DurationSeconds counts only the active segment: ConnectedAt to
+	// UpdatedAt for a finished call, ConnectedAt to now for a live one.
+	// Ring wait is never included; 0 before answer.
+	DurationSeconds int64        `json:"duration_seconds"`
+	Timings         *CallTimings `json:"timings,omitempty"`
 }
 
 func (c *Call) public() PublicCall {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.publicLocked()
+	snapshot := c.publicLocked()
+	c.mu.Unlock()
+	// Media readiness is observed outside the call lock: it reads the RTP
+	// session and the audio bridge, which must never be probed while
+	// holding c.mu. Status polling (~1 s cadence) is the observation
+	// point, so MediaReadyAt has ~1 s granularity; that is the documented
+	// precision of the answer-to-first-media segment.
+	if !snapshot.MediaReady && c.mediaCheck != nil && c.mediaCheck() {
+		c.mu.Lock()
+		if !c.mediaReady {
+			c.mediaReady = true
+			c.mediaReadyAt = time.Now()
+		}
+		snapshot = c.publicLocked()
+		c.mu.Unlock()
+	}
+	return snapshot
 }
 
+func msBetween(a, b time.Time) *int64 {
+	if a.IsZero() || b.IsZero() {
+		return nil
+	}
+	ms := b.Sub(a).Milliseconds()
+	if ms < 0 {
+		ms = 0
+	}
+	return &ms
+}
+
+// publicLocked builds the JSON view. Caller must hold c.mu.
 func (c *Call) publicLocked() PublicCall {
+	now := time.Now()
+	duration := int64(0)
+	if !c.ConnectedAt.IsZero() {
+		end := now
+		if IsTerminalState(c.State) {
+			end = c.UpdatedAt
+		}
+		if d := end.Sub(c.ConnectedAt); d > 0 {
+			duration = int64(d / time.Second)
+		}
+	}
+	timings := &CallTimings{
+		DialToRingingMs:    msBetween(c.StartedAt, c.ringAt),
+		RingToAnswerMs:     msBetween(c.ringAt, c.ConnectedAt),
+		AnswerToFirstMedia: msBetween(c.ConnectedAt, c.mediaReadyAt),
+		DialToConnectedMs:  msBetween(c.StartedAt, c.ConnectedAt),
+	}
 	return PublicCall{
 		ID: c.ID, Direction: c.Direction, Number: c.Number, State: c.State,
 		StartedAt: c.StartedAt, ConnectedAt: c.ConnectedAt, Error: c.Error,
-		LocalAudio: !c.sipLeg,
+		LocalAudio: !c.sipLeg, EndReason: c.endReason,
+		ModuleConnected: c.moduleConnected, MediaReady: c.mediaReady,
+		MediaReadyAt: c.mediaReadyAt, RingAt: c.ringAt,
+		DurationSeconds: duration, Timings: timings,
 		RTP: func() *RTPSessionStats {
 			if c.rtp == nil {
 				return nil
@@ -128,17 +221,40 @@ func (c *Call) publicLocked() PublicCall {
 	}
 }
 
-func (c *Call) setState(state CallState, err string) {
+// markModuleConnected records that the modem confirmed this call connected.
+func (c *Call) markModuleConnected() {
 	c.mu.Lock()
-	if (c.State == CallStateEnded || c.State == CallStateFailed || c.State == CallStateMissed) && c.State != state {
+	c.moduleConnected = true
+	c.mu.Unlock()
+}
+
+func (c *Call) setState(state CallState, err string) {
+	c.setStateReason(state, "", err)
+}
+
+// setStateReason moves the call to state, recording reason for terminal
+// states. An empty reason is inferred from the error text and call
+// context; when nothing distinguishes the cause it stays unknown.
+func (c *Call) setStateReason(state CallState, reason CallEndReason, err string) {
+	c.mu.Lock()
+	if IsTerminalState(c.State) && c.State != state {
 		c.mu.Unlock()
 		return
 	}
 	changed := c.State != state
 	c.State = state
 	c.UpdatedAt = time.Now()
+	if state == CallStateRinging && c.ringAt.IsZero() {
+		c.ringAt = c.UpdatedAt
+	}
 	if state == CallStateActive && c.ConnectedAt.IsZero() {
 		c.ConnectedAt = c.UpdatedAt
+	}
+	if IsTerminalState(state) {
+		if reason == "" {
+			reason = InferEndReason(state, c.Direction, err)
+		}
+		c.endReason = reason
 	}
 	if err != "" {
 		c.Error = err
@@ -449,6 +565,31 @@ func (s *Server) startCallMedia(call *Call, rtp *RTPSession, remote *net.UDPAddr
 // Calls returns public views of all tracked calls.
 func (s *Server) Calls() []PublicCall { return s.Status().Calls }
 
+// mediaReadyFor reports whether a call's audio is actually flowing right
+// now. For a SIP leg that means the RTP session is running and frames have
+// moved in either direction (the send loop emits a 20 ms frame once
+// running, so TX alone proves the pump is ticking; RX proves peer media
+// arrived). For a local call it means the bridge forwarded PCM in either
+// direction. A call with no media session yet is never ready.
+func (s *Server) mediaReadyFor(call *Call) bool {
+	call.mu.Lock()
+	rtp := call.rtp
+	sipLeg := call.sipLeg
+	id := call.ID
+	call.mu.Unlock()
+	if rtp != nil {
+		st := rtp.Stats()
+		return st.Running && (st.RXPackets+st.TXPackets > 0)
+	}
+	if sipLeg {
+		return false
+	}
+	if flow, ok := s.audio.(interface{ LocalMediaFlowing(string) bool }); ok {
+		return flow.LocalMediaFlowing(id)
+	}
+	return false
+}
+
 // --- Modem event entry points (called by the app's modem callbacks) ------
 
 // NoteRing records a RING URC. The number usually follows in a +CLIP URC
@@ -555,7 +696,7 @@ func (s *Server) IncomingCall(number string) {
 		call.mu.Unlock()
 		if state == CallStateRinging && (pending > 0 || len(registrations) == 0) {
 			s.cancelPendingDialogs(call)
-			call.setState(CallStateMissed, "no SIP client answered")
+			call.setStateReason(CallStateMissed, EndReasonNoAnswer, "no SIP client answered")
 			if s.Hangup != nil {
 				_ = s.Hangup()
 			}
@@ -569,6 +710,7 @@ func (s *Server) ModemConnected() {
 	defer s.mu.Unlock()
 	for _, c := range s.calls {
 		if c.Direction == "outbound" && (c.State == CallStateDialing || c.State == CallStateRinging) {
+			c.markModuleConnected()
 			select {
 			case <-c.connectedCh:
 			default:
@@ -579,7 +721,9 @@ func (s *Server) ModemConnected() {
 	}
 }
 
-// ModemHungUp reports the modem's NO CARRIER URC (remote hangup).
+// ModemHungUp reports the modem's NO CARRIER URC (remote hangup). An
+// active call ends as a remote hangup; a call that never connected ends
+// as a remote cancel — the two must not be conflated.
 func (s *Server) ModemHungUp() {
 	s.mu.Lock()
 	calls := make([]*Call, 0, len(s.calls))
@@ -589,7 +733,11 @@ func (s *Server) ModemHungUp() {
 	s.mu.Unlock()
 	for _, c := range calls {
 		if c.State == CallStateActive || c.State == CallStateRinging || c.State == CallStateDialing {
-			s.endCall(c, CallStateEnded, "remote hangup (NO CARRIER)")
+			reason := EndReasonRemoteCancel
+			if c.State == CallStateActive {
+				reason = EndReasonRemoteHangup
+			}
+			s.endCallReason(c, CallStateEnded, reason, "remote hangup (NO CARRIER)")
 		}
 	}
 }
@@ -648,6 +796,20 @@ func releaseReason(ms ModemCallState) string {
 	return "remote ended the call (AT+CPAS 0)"
 }
 
+// reasonForModemRelease maps the modem's release URC to an end reason for
+// one call. A captured BUSY / NO ANSWER URC names the cause directly; a
+// bare CPAS 0 falls back to remote hangup for an active call and remote
+// cancel for one that never connected.
+func reasonForModemRelease(ms ModemCallState, wasActive bool) CallEndReason {
+	if reason, ok := MapReleaseURC(ms.ReleaseReason, wasActive); ok {
+		return reason
+	}
+	if wasActive {
+		return EndReasonRemoteHangup
+	}
+	return EndReasonRemoteCancel
+}
+
 func (s *Server) reconcileWithModem(beforeDial bool) (ModemCallState, error) {
 	if s.ModemCallState == nil {
 		return ModemCallState{CPAS: -1}, nil
@@ -688,6 +850,9 @@ func (s *Server) reconcileWithModem(beforeDial bool) (ModemCallState, error) {
 				if hasDialog {
 					s.ModemConnected()
 				} else {
+					// A real +CLCC active entry is the modem confirming
+					// the call connected.
+					c.markModuleConnected()
 					c.setState(CallStateActive, "")
 				}
 			}
@@ -699,19 +864,23 @@ func (s *Server) reconcileWithModem(beforeDial bool) (ModemCallState, error) {
 		for _, c := range live {
 			c.mu.Lock()
 			est := c.established
+			wasActive := c.State == CallStateActive
 			c.mu.Unlock()
 			switch {
 			case c.Direction == "inbound":
-				s.endCall(c, CallStateEnded, releaseReason(ms))
+				s.endCallReason(c, CallStateEnded, reasonForModemRelease(ms, wasActive), releaseReason(ms))
 				ended++
 			case est:
-				s.endCall(c, CallStateEnded, releaseReason(ms))
+				s.endCallReason(c, CallStateEnded, reasonForModemRelease(ms, wasActive), releaseReason(ms))
 				ended++
 			case beforeDial:
-				s.endCall(c, CallStateEnded, "modem reports no active call (AT+CPAS 0; +CLCC phantom ignored)")
+				// Stale-record cleanup before a fresh dial: the
+				// record never connected, so its end cause is
+				// unknown rather than a hangup.
+				s.endCallReason(c, CallStateEnded, EndReasonUnknown, "modem reports no active call (AT+CPAS 0; +CLCC phantom ignored)")
 				ended++
 			case ms.ReleaseReason != "":
-				s.endCall(c, CallStateFailed, "call released by modem/network: "+ms.ReleaseReason)
+				s.endCallReason(c, CallStateFailed, reasonForModemRelease(ms, wasActive), "call released by modem/network: "+ms.ReleaseReason)
 				ended++
 			default:
 				// Still setting up: leave the record alone. The
@@ -728,7 +897,7 @@ func (s *Server) reconcileWithModem(beforeDial bool) (ModemCallState, error) {
 	expired := false
 	for _, c := range live {
 		if (c.State == CallStateDialing || c.State == CallStateRinging) && now.Sub(c.StartedAt) > dialConnectTimeout {
-			c.setState(CallStateFailed, "no answer from modem (dial timeout, no matching +CLCC entry)")
+			c.setStateReason(CallStateFailed, EndReasonNoAnswer, "no answer from modem (dial timeout, no matching +CLCC entry)")
 			expired = true
 		}
 	}
@@ -804,7 +973,7 @@ func (s *Server) DialFromAPI(number string) (string, error) {
 		s.OnCallState(call.public())
 	}
 	if s.Dial == nil {
-		call.setState(CallStateFailed, ErrNoModem.Error())
+		call.setStateReason(CallStateFailed, EndReasonNoNetwork, ErrNoModem.Error())
 		return call.ID, ErrNoModem
 	}
 	dialStart := time.Now()
@@ -843,18 +1012,33 @@ func (s *Server) AnswerCall(id string) error {
 	call.mu.Lock()
 	call.sipLeg = false
 	call.mu.Unlock()
+	// ATA accepted: the modem confirmed the call connected.
+	call.markModuleConnected()
 	call.setState(CallStateActive, "")
 	return nil
 }
 
 // HangupCall ends a call: BYE to the SIP peer when a dialog exists, ATH to
 // the modem, RTP torn down. With an empty id it ends the current call.
+// The end reason names the local action: rejecting a ringing inbound call
+// is not the same as hanging up an active one or cancelling an outbound
+// dial.
 func (s *Server) HangupCall(id string) error {
 	call, err := s.findCall(id)
 	if err != nil {
 		return err
 	}
-	s.endCall(call, CallStateEnded, "")
+	call.mu.Lock()
+	dir, state := call.Direction, call.State
+	call.mu.Unlock()
+	reason := EndReasonLocalHangup
+	switch {
+	case dir == "inbound" && state == CallStateRinging:
+		reason = EndReasonLocalReject
+	case state == CallStateDialing || state == CallStateRinging:
+		reason = EndReasonLocalCancel
+	}
+	s.endCallReason(call, CallStateEnded, reason, "")
 	if s.Hangup != nil {
 		_ = s.Hangup()
 	}
@@ -880,8 +1064,17 @@ func (s *Server) findCall(id string) (*Call, error) {
 }
 
 // endCall tears down the SIP leg (BYE when a dialog exists, 487 when an
-// outbound INVITE is still pending) and RTP.
+// outbound INVITE is still pending) and RTP. The end reason is inferred
+// from the error text; use endCallReason to name it explicitly.
 func (s *Server) endCall(c *Call, state CallState, errMsg string) {
+	s.endCallReason(c, state, "", errMsg)
+}
+
+// endCallReason is endCall with an explicit end reason. The same call
+// record is updated in place — ending a call never creates a second
+// history entry, and the stable call ID is what the later (persistent)
+// history will key on.
+func (s *Server) endCallReason(c *Call, state CallState, reason CallEndReason, errMsg string) {
 	c.mu.Lock()
 	rtp := c.rtp
 	c.rtp = nil
@@ -914,7 +1107,7 @@ func (s *Server) endCall(c *Call, state CallState, errMsg string) {
 	if src != nil && callID != "" && contact != "" && prevState == CallStateActive {
 		s.sendBye(src, callID, fromTag, toTag, contact)
 	}
-	c.setState(state, errMsg)
+	c.setStateReason(state, reason, errMsg)
 }
 
 // --- internals ----------------------------------------------------------
@@ -928,6 +1121,7 @@ func (s *Server) newCallLocked(direction, number string) *Call {
 		pendingDialogs: map[string]pendingDialog{},
 		onState:        s.OnCallState,
 	}
+	call.mediaCheck = func() bool { return s.mediaReadyFor(call) }
 	s.calls[call.ID] = call
 	return call
 }
@@ -1229,7 +1423,7 @@ func (s *Server) runOutboundDial(call *Call, number string, src *net.UDPAddr, in
 	case <-call.cancelCh:
 		return
 	case <-time.After(dialConnectTimeout):
-		call.setState(CallStateFailed, "no answer from modem (CONNECT timeout)")
+		call.setStateReason(CallStateFailed, EndReasonNoAnswer, "no answer from modem (CONNECT timeout)")
 		s.reply(src, invite, 480, "Temporarily Unavailable", nil, "", "")
 		if s.Hangup != nil {
 			_ = s.Hangup()
@@ -1271,7 +1465,7 @@ func (s *Server) handleBye(msg *sipMessage, src *net.UDPAddr) {
 		return
 	}
 	s.reply(src, msg, 200, "OK", nil, "", "")
-	s.endCall(call, CallStateEnded, "BYE from SIP client")
+	s.endCallReason(call, CallStateEnded, EndReasonRemoteHangup, "BYE from SIP client")
 	if s.Hangup != nil {
 		_ = s.Hangup()
 	}
@@ -1290,7 +1484,7 @@ func (s *Server) handleCancel(msg *sipMessage, src *net.UDPAddr) {
 	if invite != nil && (call.State == CallStateDialing || call.State == CallStateRinging) {
 		s.reply(inviteSrc, invite, 487, "Request Terminated", nil, "", "")
 	}
-	s.endCall(call, CallStateEnded, "CANCEL from SIP client")
+	s.endCallReason(call, CallStateEnded, EndReasonRemoteCancel, "CANCEL from SIP client")
 	if s.Hangup != nil {
 		_ = s.Hangup()
 	}
@@ -1340,7 +1534,8 @@ func (s *Server) handleResponse(msg *sipMessage, src *net.UDPAddr) {
 		state := call.State
 		call.mu.Unlock()
 		if remaining == 0 && state == CallStateRinging {
-			call.setState(CallStateFailed, fmt.Sprintf("SIP client rejected (%d %s)", msg.StatusCode, msg.Reason))
+			reason, _ := MapSIPRejectReason(msg.StatusCode)
+			call.setStateReason(CallStateFailed, reason, fmt.Sprintf("SIP client rejected (%d %s)", msg.StatusCode, msg.Reason))
 			if s.Hangup != nil {
 				_ = s.Hangup()
 			}
@@ -1419,6 +1614,8 @@ func (s *Server) handleInviteAccepted(call *Call, msg *sipMessage, src *net.UDPA
 		rtp.Stop()
 		return
 	}
+	// ATA accepted: the modem confirmed the call connected.
+	call.markModuleConnected()
 	remote := remoteAddrForSDP(media, src)
 	if err := s.startCallMedia(call, rtp, remote); err != nil {
 		log.Printf("[sip] RTP start failed: %v", err)
