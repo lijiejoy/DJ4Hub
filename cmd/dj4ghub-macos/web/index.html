@@ -140,6 +140,30 @@
           <div><span>会话总流量</span><strong id="traffic-session-total">--</strong></div>
         </div>
         <section id="hardware-details" class="hardware-details" hidden></section>
+        <section id="subscription-panel" class="subscription-panel" aria-labelledby="subscription-title">
+          <div class="section-heading">
+            <div><h2 id="subscription-title">本机号码</h2><p id="subscription-source" class="inline-status">尚未读取号码</p></div>
+            <button id="refresh-subscription" class="secondary" type="button">刷新号码</button>
+          </div>
+          <div class="diagnostic-grid">
+            <div><span>本机号码（点击显示 / 隐藏）</span><strong id="subscription-number">--</strong></div>
+            <div><span>号码来源</span><strong id="subscription-number-source">--</strong></div>
+            <div><span>订阅标识</span><strong id="subscription-id">--</strong></div>
+            <div><span>ICCID</span><strong id="subscription-iccid">--</strong></div>
+          </div>
+          <form id="subscription-remark-form" class="message-composer">
+            <input id="subscription-remark" type="tel" placeholder="运营商未提供号码时可手动备注" autocomplete="tel">
+            <button class="secondary" type="submit">保存备注</button>
+            <button id="subscription-remark-clear" class="secondary" type="button">清除备注</button>
+          </form>
+          <p class="inline-status">备注号码仅作本机显示，不会显示为运营商已验证的号码。</p>
+          <div class="section-heading">
+            <div><h2>初始化诊断</h2><p class="inline-status">只报告结果与建议，不执行重启、重枚举等修复动作。</p></div>
+            <button id="run-diagnostics" class="secondary" type="button">运行诊断</button>
+          </div>
+          <p id="diagnostics-summary" class="inline-status">尚未运行诊断</p>
+          <div id="diagnostics-list" class="list empty">点击“运行诊断”检查卡、注册、权限与语音路由。</div>
+        </section>
         <p id="workmode-status" class="inline-status attention" hidden></p>
         <section class="activity-section" aria-labelledby="activity-title">
           <div class="section-heading activity-heading">
@@ -221,6 +245,28 @@
             <button id="refresh-sip" class="secondary" type="button">刷新状态</button>
           </div>
         </div>
+        <div class="surface-panel" id="sip-in-call-panel" hidden>
+          <div class="panel-heading"><div><strong>通话中控制</strong></div><small id="sip-in-call-state">未通话</small></div>
+          <div class="heading-actions sip-call-actions">
+            <button id="sip-mic-mute" class="secondary" type="button">麦克风静音</button>
+            <button id="sip-speaker-mute" class="secondary" type="button">扬声器静音</button>
+          </div>
+          <div id="sip-dtmf-pad" class="heading-actions sip-call-actions" role="group" aria-label="电话按键">
+            <button class="secondary" type="button" data-digit="1">1</button>
+            <button class="secondary" type="button" data-digit="2">2</button>
+            <button class="secondary" type="button" data-digit="3">3</button>
+            <button class="secondary" type="button" data-digit="4">4</button>
+            <button class="secondary" type="button" data-digit="5">5</button>
+            <button class="secondary" type="button" data-digit="6">6</button>
+            <button class="secondary" type="button" data-digit="7">7</button>
+            <button class="secondary" type="button" data-digit="8">8</button>
+            <button class="secondary" type="button" data-digit="9">9</button>
+            <button class="secondary" type="button" data-digit="*">*</button>
+            <button class="secondary" type="button" data-digit="0">0</button>
+            <button class="secondary" type="button" data-digit="#">#</button>
+          </div>
+          <p id="sip-in-call-status" class="inline-status"></p>
+        </div>
         <div class="section-heading">
           <div><h2>通话记录</h2><p id="sip-calls-status" class="inline-status">暂无通话</p></div>
         </div>
@@ -243,7 +289,13 @@
             <label><span>RTP 结束端口</span><input id="sip-rtp-max" type="number" min="1024" max="65535" placeholder="20000"></label>
             <button class="full" type="submit">保存 SIP 设置</button>
           </form>
+          <form id="sip-audio-devices-form" class="sip-settings-form">
+            <label><span>麦克风（下次通话生效）</span><select id="sip-audio-input"><option value="">系统默认（内置）</option></select></label>
+            <label><span>扬声器（下次通话生效）</span><select id="sip-audio-output"><option value="">系统默认（内置）</option></select></label>
+            <button id="sip-audio-devices-save" class="secondary" type="button">保存音频设备</button>
+          </form>
           <p id="sip-settings-status" class="inline-status"></p>
+          <p id="sip-audio-devices-status" class="inline-status"></p>
         </div>
       </section>
 

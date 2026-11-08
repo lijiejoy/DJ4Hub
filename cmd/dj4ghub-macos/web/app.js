@@ -300,6 +300,113 @@ async function loadStatus() {
   }
 }
 
+
+// --- Subscription identity & number (delivery point 5) -------------------
+// 本机号码只在启动、手动刷新或换卡时读取，不跟随 10 秒状态轮询，避免
+// 对模块增加 AT 压力。备注号码明确标注为用户备注，不显示为运营商已验证。
+let lastSubscription = null;
+let subscriptionNumberRevealed = false;
+
+function renderSubscription(data) {
+  lastSubscription = data;
+  const number = data.number || "";
+  const shown = !number ? "--" : (subscriptionNumberRevealed ? number : maskPhoneNumber(number));
+  setValue("#subscription-number", shown, number ? "neutral" : "muted");
+  setValue("#subscription-number-source", data.number_label || data.number_source || "--", data.number_source === "remark" ? "warn" : "neutral");
+  setValue("#subscription-id", data.subscription_id || "--", "neutral");
+  setValue("#subscription-iccid", data.iccid_masked || "--", "neutral");
+  const source = $("#subscription-source");
+  source.textContent = data.stale
+    ? "号码可能过期：上次刷新失败，显示的是旧读数"
+    : (data.number_source === "auto" ? "号码由 SIM 自动读取（AT+CNUM）"
+      : data.number_source === "remark" ? "当前显示的是用户备注号码，未经运营商验证"
+      : "未读到号码：可手动备注，或检查 SIM 卡");
+  const remark = $("#subscription-remark");
+  if (document.activeElement !== remark) remark.value = "";
+}
+
+async function loadSubscription() {
+  try {
+    renderSubscription(await api("/api/subscription"));
+  } catch (error) {
+    $("#subscription-source").textContent = `号码未读取：${error.message}`;
+  }
+}
+
+async function saveSubscriptionRemark(number) {
+  const saved = await api("/api/subscription/remark", { method: "POST", body: JSON.stringify({ number }) });
+  renderSubscription(saved);
+  notice(number ? "备注号码已保存" : "备注已清除");
+}
+
+$("#subscription-number").addEventListener("click", () => {
+  if (!lastSubscription || !lastSubscription.number) return;
+  subscriptionNumberRevealed = !subscriptionNumberRevealed;
+  renderSubscription(lastSubscription);
+});
+
+$("#refresh-subscription").addEventListener("click", async (event) => {
+  const button = event.currentTarget;
+  button.disabled = true;
+  try {
+    renderSubscription(await api("/api/subscription/refresh", { method: "POST" }));
+  } catch (error) {
+    notice(error.message);
+  } finally {
+    button.disabled = false;
+  }
+});
+
+$("#subscription-remark-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  try {
+    await saveSubscriptionRemark($("#subscription-remark").value);
+  } catch (error) {
+    notice(error.message);
+  }
+});
+
+$("#subscription-remark-clear").addEventListener("click", async () => {
+  try {
+    await saveSubscriptionRemark("");
+  } catch (error) {
+    notice(error.message);
+  }
+});
+
+// --- Init diagnostics (delivery point 5) ---------------------------------
+// 只报告结果与建议，不执行任何修复动作；通话期间修复一律视为被阻塞。
+async function runInitDiagnostics(button) {
+  button.disabled = true;
+  try {
+    const result = await api("/api/diagnostics/init");
+    const summary = $("#diagnostics-summary");
+    summary.textContent = result.summary === "ok"
+      ? "全部通过：未发现需要恢复的问题"
+      : result.summary === "attention" ? "有待观察项，见下方建议"
+      : result.summary === "error" ? "发现需要处理的问题，见下方建议"
+      : "部分项目未确认";
+    if (result.call_active) summary.textContent += "（通话进行中，修复动作已阻塞）";
+    const list = $("#diagnostics-list");
+    list.classList.remove("empty");
+    list.replaceChildren(...result.checks.map((check) => diagnosticCard(
+      `${check.label} · ${check.status === "pass" ? "通过" : check.status === "warn" ? "待观察" : check.status === "fail" ? "失败" : "未确认"}`,
+      check.detail,
+      check.suggestion || "",
+    )));
+    const note = document.createElement("p");
+    note.className = "inline-status";
+    note.textContent = result.note || "";
+    list.append(note);
+  } catch (error) {
+    $("#diagnostics-summary").textContent = `诊断失败：${error.message}`;
+  } finally {
+    button.disabled = false;
+  }
+}
+
+$("#run-diagnostics").addEventListener("click", (event) => void runInitDiagnostics(event.currentTarget));
+
 async function loadSMS() {
   const list = $("#sms-list");
   try {
@@ -1175,6 +1282,11 @@ let callRingTimer = null;
 let callNotification = null;
 let callRestoreFocus = null;
 let nativeAlertCallID = "";
+let sipActiveCallId = null;
+let sipMicMuted = false;
+let sipSpeakerMuted = false;
+let sipMuteCallId = null;
+let sipAudioDevicesLoaded = false;
 const callToneNodes = new Set();
 const notifiedCalls = new Set();
 const normalPageTitle = document.title;
@@ -1340,6 +1452,30 @@ function sipStateLabel(state) {
   return { dialing: "拨号中", ringing: "振铃中", active: "通话中", ended: "已结束", failed: "失败", missed: "未接" }[state] || state;
 }
 
+// End reason labels mirror sip.EndReasonLabel; "unknown" is intentionally
+// not shown — an undistinguished cause is reported as nothing, not a guess.
+function sipEndReasonLabel(reason) {
+  return {
+    local_hangup: "本机挂断", remote_hangup: "对方挂断", local_reject: "主动拒接",
+    remote_cancel: "对方取消", no_answer: "未接超时", no_network: "无网络",
+    busy: "忙线", media_failed: "媒体失败", device_disconnected: "设备断开",
+    local_cancel: "本机取消",
+  }[reason] || "";
+}
+
+function formatCallDuration(seconds) {
+  const total = Math.max(0, Math.floor(seconds || 0));
+  const minutes = Math.floor(total / 60);
+  return `${String(minutes).padStart(2, "0")}:${String(total % 60).padStart(2, "0")}`;
+}
+
+function sipCallFlags(call) {
+  const flags = [];
+  if (call.module_connected) flags.push("模块已接通");
+  if (call.media_ready) flags.push("媒体就绪");
+  return flags.length ? ` · ${flags.join(" · ")}` : "";
+}
+
 async function loadSIP() {
   if (sipInFlight) return;
   sipInFlight = true;
@@ -1371,9 +1507,13 @@ async function loadSIP() {
         const item = document.createElement("div");
         item.className = "item";
         const rtp = call.rtp ? ` · RTP ${call.rtp.local_port} 收 ${call.rtp.rx_packets} 发 ${call.rtp.tx_packets}` : "";
-        item.textContent = `${call.direction === "inbound" ? "来电" : "去电"} ${call.number} · ${sipStateLabel(call.state)}${call.error ? " · " + call.error : ""}${rtp}`;
+        const reason = sipEndReasonLabel(call.end_reason);
+        const reasonText = reason ? ` · ${reason}` : "";
+        const durationText = call.duration_seconds ? ` · ${formatCallDuration(call.duration_seconds)}` : "";
+        item.textContent = `${call.direction === "inbound" ? "来电" : "去电"} ${call.number} · ${sipStateLabel(call.state)}${reasonText}${durationText}${sipCallFlags(call)}${call.error ? " · " + call.error : ""}${rtp}`;
         callsList.appendChild(item);
       }
+      updateInCallPanel(calls);
     }
     const regs = status.registrations || [];
     const regList = $("#sip-reg-list");
@@ -1416,6 +1556,121 @@ async function loadSIP() {
     sipInFlight = false;
   }
 }
+
+// In-call panel: DTMF keypad and mic/speaker mute for the live call.
+// Mute is per-call on the server, so switching calls resets the toggles.
+function updateInCallPanel(calls) {
+  const panel = $("#sip-in-call-panel");
+  const live = [...calls].reverse().find((c) => ["dialing", "ringing", "active"].includes(c.state)) || null;
+  sipActiveCallId = live ? live.id : null;
+  panel.hidden = !live;
+  if (!live) return;
+  if (sipMuteCallId !== live.id) {
+    sipMuteCallId = live.id;
+    sipMicMuted = false;
+    sipSpeakerMuted = false;
+  }
+  const stateLine = `${sipStateLabel(live.state)}${live.duration_seconds ? ` · ${formatCallDuration(live.duration_seconds)}` : ""}${sipCallFlags(live)}`;
+  $("#sip-in-call-state").textContent = stateLine;
+  const canControl = live.state === "active" && live.local_audio;
+  $("#sip-mic-mute").disabled = !canControl;
+  $("#sip-speaker-mute").disabled = !canControl;
+  $("#sip-mic-mute").textContent = sipMicMuted ? "取消麦克风静音" : "麦克风静音";
+  $("#sip-speaker-mute").textContent = sipSpeakerMuted ? "取消扬声器静音" : "扬声器静音";
+  const canDtmf = live.state === "active";
+  document.querySelectorAll("#sip-dtmf-pad button").forEach((button) => { button.disabled = !canDtmf; });
+}
+
+async function sendSipAudioControls() {
+  if (!sipActiveCallId) return;
+  try {
+    await api("/api/sip/audio-controls", {
+      method: "POST",
+      body: JSON.stringify({ call_id: sipActiveCallId, microphone_muted: sipMicMuted, speaker_muted: sipSpeakerMuted }),
+    });
+    $("#sip-in-call-status").textContent = "";
+  } catch (error) {
+    $("#sip-in-call-status").textContent = `静音设置失败：${error.message}`;
+  }
+}
+
+$("#sip-mic-mute").addEventListener("click", () => {
+  sipMicMuted = !sipMicMuted;
+  $("#sip-mic-mute").textContent = sipMicMuted ? "取消麦克风静音" : "麦克风静音";
+  void sendSipAudioControls();
+});
+
+$("#sip-speaker-mute").addEventListener("click", () => {
+  sipSpeakerMuted = !sipSpeakerMuted;
+  $("#sip-speaker-mute").textContent = sipSpeakerMuted ? "取消扬声器静音" : "扬声器静音";
+  void sendSipAudioControls();
+});
+
+$("#sip-dtmf-pad").addEventListener("click", async (event) => {
+  const button = event.target.closest("button[data-digit]");
+  if (!button || button.disabled || !sipActiveCallId) return;
+  const digit = button.dataset.digit;
+  try {
+    await api("/api/sip/dtmf", { method: "POST", body: JSON.stringify({ call_id: sipActiveCallId, digit }) });
+    $("#sip-in-call-status").textContent = `已发送按键 ${digit}`;
+  } catch (error) {
+    $("#sip-in-call-status").textContent = `按键发送失败：${error.message}`;
+  }
+});
+
+function fillSipAudioSelect(select, devices, wantInput, selected) {
+  select.innerHTML = "";
+  const fallback = document.createElement("option");
+  fallback.value = "";
+  fallback.textContent = "系统默认（内置）";
+  select.appendChild(fallback);
+  for (const device of devices) {
+    if (wantInput && !device.has_input) continue;
+    if (!wantInput && !device.has_output) continue;
+    const option = document.createElement("option");
+    option.value = device.uid;
+    option.textContent = device.name;
+    if (device.uid === selected || device.name === selected) option.selected = true;
+    select.appendChild(option);
+  }
+  if (selected && ![...select.options].some((o) => o.selected && o.value)) {
+    // Stored selection is no longer listed (device unplugged): keep it
+    // visible instead of silently falling back to another device.
+    const option = document.createElement("option");
+    option.value = selected;
+    option.textContent = `${selected}（设备不在列表中）`;
+    option.selected = true;
+    select.appendChild(option);
+  }
+}
+
+async function loadSipAudioDevices() {
+  if (sipAudioDevicesLoaded) return;
+  try {
+    const data = await api("/api/sip/audio-devices");
+    fillSipAudioSelect($("#sip-audio-input"), data.devices || [], true, data.input || "");
+    fillSipAudioSelect($("#sip-audio-output"), data.devices || [], false, data.output || "");
+    sipAudioDevicesLoaded = true;
+    $("#sip-audio-devices-status").textContent = "";
+  } catch (error) {
+    $("#sip-audio-devices-status").textContent = `音频设备读取失败：${error.message}`;
+  }
+}
+
+$("#sip-audio-devices-save").addEventListener("click", async () => {
+  const status = $("#sip-audio-devices-status");
+  status.textContent = "正在保存…";
+  try {
+    await api("/api/sip/audio-devices", {
+      method: "POST",
+      body: JSON.stringify({ input: $("#sip-audio-input").value, output: $("#sip-audio-output").value }),
+    });
+    status.textContent = "音频设备已保存，下次通话生效";
+    notice("音频设备已保存，下次通话生效");
+  } catch (error) {
+    status.textContent = `保存失败：${error.message}`;
+  }
+});
 
 function setSIPPolling() {
   if (sipTimer) return;
@@ -1501,7 +1756,7 @@ document.querySelectorAll(".tab").forEach((tab) => {
     setNetworkActivityPolling(tab.dataset.view === "overview");
     if (tab.dataset.view === "esim") loadESIM();
     else setESIMHealthPolling(false);
-    if (tab.dataset.view === "calls") void loadSIP();
+    if (tab.dataset.view === "calls") { void loadSIP(); void loadSipAudioDevices(); }
     if (tab.dataset.view === "tasks") void loadTasks();
     if (tab.dataset.view === "notify") void loadNotify();
     if (tab.dataset.view === "radio") setRadioPolling(true);
@@ -2144,6 +2399,7 @@ $("#task-form").addEventListener("submit", async (event) => {
 loadStatus();
 
 loadStatus();
+loadSubscription();
 loadSMS();
 loadSidebarConnection();
 setSIPPolling();
