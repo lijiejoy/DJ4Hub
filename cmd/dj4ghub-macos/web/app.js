@@ -1743,6 +1743,7 @@ $("#sip-settings-form").addEventListener("submit", async (event) => {
   }
 });
 
+
 document.querySelectorAll(".tab").forEach((tab) => {
   tab.addEventListener("click", () => {
     document.querySelectorAll(".tab").forEach((item) => {
@@ -2603,3 +2604,248 @@ document.querySelectorAll("[data-notify-test]").forEach((button) => {
     }
   });
 });
+
+/* delivery-4: 短信会话、搜索、草稿与发送状态 ---------------------------------- */
+/* 只读交付点 2 的历史接口 + 本交付点的新会话接口；发送复用 POST /api/sms/send。 */
+let convCurrentPeer = ""; // 标准化号码
+let convCurrentPeerRaw = "";
+let convSearchMode = false;
+let convDraftTimer = null;
+
+function convEl(id) { return document.getElementById(id); }
+
+async function loadConversations() {
+  const list = convEl("conversations-list");
+  const status = convEl("conversations-status");
+  try {
+    const result = await api("/api/conversations?limit=50");
+    const totalUnread = result.items.reduce((n, c) => n + (c.unread_count || 0), 0);
+    status.textContent = `共 ${result.total} 个会话 · 未读 ${totalUnread} 条`;
+    if (!result.items.length) {
+      list.className = "list empty";
+      list.textContent = "暂无会话";
+      return;
+    }
+    list.className = "list";
+    list.replaceChildren(...result.items.map((conv) => {
+      const row = document.createElement("article");
+      row.className = "item conv-item";
+      row.tabIndex = 0;
+      row.setAttribute("role", "button");
+      const peer = document.createElement("strong");
+      peer.textContent = conv.peer || conv.peer_normalized;
+      const preview = document.createElement("p");
+      preview.textContent = (conv.last_direction === "out" ? "我：" : "") + (conv.last_body || "");
+      const meta = document.createElement("div");
+      meta.className = "conv-meta";
+      const time = document.createElement("time");
+      time.textContent = new Date(conv.last_at).toLocaleString();
+      meta.append(time);
+      if (conv.unread_count > 0) {
+        const badge = document.createElement("span");
+        badge.className = "conv-unread-badge";
+        badge.textContent = `未读 ${conv.unread_count}`;
+        meta.append(badge);
+      }
+      if (conv.last_direction === "out" && conv.last_outbox_status_label) {
+        const st = document.createElement("small");
+        st.textContent = conv.last_outbox_status_label;
+        meta.append(st);
+      }
+      const sub = document.createElement("small");
+      sub.textContent = conv.attribution_unknown ? "归属未知" : `卡 ${conv.subscription_id}`;
+      meta.append(sub);
+      row.append(peer, preview, meta);
+      const open = () => void openConversation(conv.peer_normalized, conv.peer || conv.peer_normalized);
+      row.addEventListener("click", open);
+      row.addEventListener("keydown", (event) => { if (event.key === "Enter") open(); });
+      return row;
+    }));
+  } catch (error) {
+    status.textContent = `会话加载失败：${error.message}`;
+  }
+}
+
+async function searchConversations() {
+  const q = convEl("conv-search").value.trim();
+  const list = convEl("conversations-list");
+  if (!q) {
+    convSearchMode = false;
+    await loadConversations();
+    return;
+  }
+  convSearchMode = true;
+  try {
+    const result = await api(`/api/conversations/search?q=${encodeURIComponent(q)}&limit=50`);
+    convEl("conversations-status").textContent = `搜索“${q}”：${result.total} 条`;
+    if (!result.items.length) {
+      list.className = "list empty";
+      list.textContent = "没有匹配的短信";
+      return;
+    }
+    list.className = "list";
+    list.replaceChildren(...result.items.map((msg) => {
+      const row = document.createElement("article");
+      row.className = "item conv-item";
+      const peer = document.createElement("strong");
+      peer.textContent = msg.peer || msg.peer_normalized;
+      const content = document.createElement("p");
+      content.textContent = msg.body;
+      const time = document.createElement("time");
+      time.textContent = new Date(msg.received_at).toLocaleString();
+      row.append(peer, content, time);
+      row.addEventListener("click", () => void openConversation(msg.peer_normalized, msg.peer || msg.peer_normalized));
+      return row;
+    }));
+  } catch (error) {
+    notice(error.message);
+  }
+}
+
+async function openConversation(peerNormalized, peerRaw) {
+  convCurrentPeer = peerNormalized;
+  convCurrentPeerRaw = peerRaw;
+  convEl("conversation-thread").hidden = false;
+  convEl("thread-peer").textContent = peerRaw;
+  convEl("thread-message").value = "";
+  convEl("thread-draft-status").textContent = "";
+  convEl("thread-send-status").textContent = "";
+  await loadThread();
+  try {
+    await api("/api/conversations/read", { method: "POST", body: JSON.stringify({ peer: peerNormalized }) });
+  } catch (error) { /* 未读标记失败不阻塞看消息 */ }
+  await loadConversations();
+  try {
+    const drafts = await api("/api/conversations/drafts");
+    const draft = (drafts.items || []).find((d) => d.peer_normalized === peerNormalized);
+    if (draft && draft.body) {
+      convEl("thread-message").value = draft.body;
+      convEl("thread-draft-status").textContent = `已恢复草稿 · ${new Date(draft.updated_at).toLocaleString()}`;
+    }
+  } catch (error) { /* 草稿读失败不阻塞 */ }
+  convEl("thread-message").focus();
+}
+
+async function loadThread() {
+  const box = convEl("thread-messages");
+  try {
+    const result = await api(`/api/conversations/thread?peer=${encodeURIComponent(convCurrentPeer)}&limit=50`);
+    convEl("thread-meta").textContent = `共 ${result.total} 条 · ${convCurrentPeerRaw}`;
+    if (!result.items.length) {
+      box.className = "list empty";
+      box.textContent = "暂无消息";
+      return;
+    }
+    box.className = "list conv-thread-list";
+    box.replaceChildren(...result.items.map((msg) => {
+      const row = document.createElement("article");
+      row.className = `item conv-message ${msg.direction === "out" ? "conv-out" : "conv-in"}`;
+      const who = document.createElement("strong");
+      who.textContent = msg.direction === "out" ? "我" : (msg.peer || msg.peer_normalized);
+      const content = document.createElement("p");
+      content.textContent = msg.body;
+      const meta = document.createElement("div");
+      meta.className = "conv-meta";
+      const time = document.createElement("time");
+      time.textContent = new Date(msg.received_at).toLocaleString();
+      meta.append(time);
+      if (msg.direction === "out" && msg.outbox_status_label) {
+        const st = document.createElement("small");
+        st.textContent = msg.outbox_status_label;
+        if (msg.outbox_status === "uncertain") st.textContent += "（无法确认是否已发送，请勿重复发送）";
+        if (msg.outbox_status === "failed") st.textContent += "（已证明未发送，可重发）";
+        meta.append(st);
+      }
+      if (msg.concat_total) {
+        const seg = document.createElement("small");
+        seg.textContent = `长短信 ${msg.concat_segments || 1}/${msg.concat_total} 段`;
+        meta.append(seg);
+      }
+      row.append(who, content, meta);
+      return row;
+    }));
+  } catch (error) {
+    box.className = "list empty";
+    box.textContent = `加载失败：${error.message}`;
+  }
+}
+
+function scheduleDraftSave() {
+  clearTimeout(convDraftTimer);
+  convDraftTimer = setTimeout(async () => {
+    if (!convCurrentPeer) return;
+    const body = convEl("thread-message").value;
+    try {
+      await api("/api/conversations/drafts", { method: "PUT", body: JSON.stringify({ peer: convCurrentPeer, body }) });
+      convEl("thread-draft-status").textContent = body.trim() ? `草稿已保存 · ${new Date().toLocaleTimeString()}` : "草稿已清空";
+    } catch (error) {
+      convEl("thread-draft-status").textContent = `草稿保存失败：${error.message}`;
+    }
+  }, 800);
+}
+
+function downloadExport(peer) {
+  const params = new URLSearchParams({ format: "csv" });
+  if (peer) params.set("peer", peer);
+  const a = document.createElement("a");
+  a.href = `/api/conversations/export?${params.toString()}`;
+  a.download = "";
+  document.body.append(a);
+  a.click();
+  a.remove();
+}
+
+convEl("conv-search-btn").addEventListener("click", () => void searchConversations());
+convEl("conv-search").addEventListener("keydown", (event) => {
+  if (event.key === "Enter") { event.preventDefault(); void searchConversations(); }
+});
+convEl("conv-search-clear").addEventListener("click", async () => {
+  convEl("conv-search").value = "";
+  convSearchMode = false;
+  await loadConversations();
+});
+convEl("conv-export-all").addEventListener("click", () => downloadExport(""));
+convEl("thread-export").addEventListener("click", () => downloadExport(convCurrentPeer));
+convEl("thread-close").addEventListener("click", async () => {
+  convCurrentPeer = "";
+  convCurrentPeerRaw = "";
+  convEl("conversation-thread").hidden = true;
+  await loadConversations();
+});
+convEl("thread-message").addEventListener("input", scheduleDraftSave);
+convEl("thread-draft-discard").addEventListener("click", async () => {
+  if (!convCurrentPeer) return;
+  try {
+    await api(`/api/conversations/drafts?peer=${encodeURIComponent(convCurrentPeer)}`, { method: "DELETE" });
+    convEl("thread-message").value = "";
+    convEl("thread-draft-status").textContent = "草稿已丢弃";
+  } catch (error) {
+    notice(error.message);
+  }
+});
+convEl("thread-send-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const input = convEl("thread-message");
+  const text = input.value.trim();
+  if (!text || !convCurrentPeer) return;
+  const status = convEl("thread-send-status");
+  status.textContent = "正在发送…";
+  try {
+    const result = await api("/api/sms/send", { method: "POST", body: JSON.stringify({ phone: convCurrentPeer, message: text }) });
+    input.value = "";
+    try {
+      await api(`/api/conversations/drafts?peer=${encodeURIComponent(convCurrentPeer)}`, { method: "DELETE" });
+    } catch (error) { /* 发送成功后草稿删失败不阻塞 */ }
+    convEl("thread-draft-status").textContent = "";
+    status.textContent = `已提交（${result.segments || 1} 段）· 送达状态见上方消息`;
+    await loadThread();
+    await loadConversations();
+  } catch (error) {
+    status.textContent = `发送失败：${error.message}（已记为“结果不确定”，请勿重复发送）`;
+  }
+});
+document.querySelector('.tab[data-view="sms"]').addEventListener("click", () => void loadConversations());
+loadConversations();
+setInterval(() => {
+  if (!convSearchMode && $("#sms").classList.contains("active") && !convCurrentPeer) void loadConversations();
+}, 30000);

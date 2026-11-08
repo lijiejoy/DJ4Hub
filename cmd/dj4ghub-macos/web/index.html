@@ -209,6 +209,39 @@
             </div>
           </form>
         </div>
+        <!-- delivery-4: 短信会话（按号码分组、搜索、草稿、导出） -->
+        <div class="surface-panel" id="conversations-panel">
+          <div class="panel-heading"><div><span class="panel-icon" aria-hidden="true">💬</span><strong>会话</strong></div><small id="conversations-status">按号码分组 · 未读角标</small></div>
+          <div class="conv-toolbar">
+            <input id="conv-search" type="search" placeholder="搜索号码或短信内容…" autocomplete="off" aria-label="搜索短信">
+            <button id="conv-search-btn" class="secondary" type="button">搜索</button>
+            <button id="conv-search-clear" class="secondary" type="button">清空</button>
+            <button id="conv-export-all" class="secondary" type="button">导出全部短信</button>
+          </div>
+          <div id="conversations-list" class="list empty">暂无会话</div>
+          <div id="conversation-thread" hidden>
+            <div class="section-heading">
+              <div><h2 id="thread-peer">会话</h2><p id="thread-meta" class="inline-status"></p></div>
+              <div class="heading-actions">
+                <button id="thread-export" class="secondary" type="button">导出本会话</button>
+                <button id="thread-close" class="secondary" type="button">返回列表</button>
+              </div>
+            </div>
+            <div id="thread-messages" class="list empty">暂无消息</div>
+            <form id="thread-send-form" class="message-composer">
+              <label class="message-field" for="thread-message">
+                <span class="sr-only">短信内容</span>
+                <textarea id="thread-message" placeholder="输入短信内容…（自动保存草稿）" maxlength="1000" required></textarea>
+              </label>
+              <div class="composer-footer">
+                <span id="thread-draft-status" class="message-counter" aria-live="polite"></span>
+                <button id="thread-draft-discard" class="secondary" type="button">丢弃草稿</button>
+                <button class="composer-send" type="submit" aria-label="发送短信"><span class="composer-send-label">发送</span></button>
+              </div>
+            </form>
+            <p id="thread-send-status" class="inline-status"></p>
+          </div>
+        </div>
         <div class="section-heading">
           <div><h2>收件箱</h2><p id="sms-status" class="inline-status">尚未读取短信</p></div>
           <div class="heading-actions">
@@ -267,7 +300,7 @@
           </div>
           <p id="sip-in-call-status" class="inline-status"></p>
         </div>
-        <div class="section-heading">
+                <div class="section-heading">
           <div><h2>通话记录</h2><p id="sip-calls-status" class="inline-status">暂无通话</p></div>
         </div>
         <div id="sip-calls-list" class="list empty">暂无通话</div>

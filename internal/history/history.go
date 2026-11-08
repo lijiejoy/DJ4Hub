@@ -44,7 +44,7 @@ import (
 
 // CurrentSchemaVersion 是当前数据库结构版本。每次结构变更加一个迁移，
 // 递增该值；旧库按 schema_migrations 表逐个应用缺失的迁移。
-const CurrentSchemaVersion = 1
+const CurrentSchemaVersion = 2
 
 // DefaultDBFileName 是数据库文件名，与上游历史实现保持同一文件名，
 // 便于运维定位；本包不读取上游的 communication_record 旧表。
@@ -252,6 +252,20 @@ CREATE TABLE IF NOT EXISTS outbox (
 );
 CREATE INDEX IF NOT EXISTS idx_outbox_peer_created
   ON outbox (peer_normalized, created_at DESC, id DESC);
+`,
+	},
+	{
+		// 交付点 4：短信草稿表（sms_drafts）。同一号码永远只有一条
+		// 最新草稿；草稿只存本地，不上传、不自动发送。
+		version: 2,
+		name:    "v2-sms-drafts",
+		sql: `
+CREATE TABLE IF NOT EXISTS sms_drafts (
+  peer_normalized TEXT PRIMARY KEY,
+  peer_raw        TEXT NOT NULL DEFAULT '',
+  body            TEXT NOT NULL DEFAULT '',
+  updated_at      INTEGER NOT NULL
+);
 `,
 	},
 }

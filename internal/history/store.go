@@ -255,6 +255,8 @@ type SMSQuery struct {
 	SubscriptionID string
 	Direction      string // "" | "in" | "out"
 	PeerNormalized string
+	Search         string // 交付点 4：匹配 peer_raw / peer_normalized / body（LIKE，见 smsWhere）
+	UnreadOnly     bool   // 交付点 4：只返回未读收件
 	Limit          int
 	Offset         int
 }
@@ -312,7 +314,20 @@ func smsWhere(q SMSQuery) (string, []any) {
 		where += " AND peer_normalized = ?"
 		args = append(args, q.PeerNormalized)
 	}
+	if q.UnreadOnly {
+		where += " AND direction = 'in' AND is_read = 0"
+	}
+	if q.Search != "" {
+		like := "%" + escapeLike(q.Search) + "%"
+		where += " AND (peer_raw LIKE ? ESCAPE '\\' OR peer_normalized LIKE ? ESCAPE '\\' OR body LIKE ? ESCAPE '\\')"
+		args = append(args, like, like, like)
+	}
 	return where, args
+}
+
+// escapeLike 转义 LIKE 通配符，用户输入的 % / _ 只按字面匹配（交付点 4）。
+func escapeLike(s string) string {
+	return strings.NewReplacer("\\", "\\\\", "%", "\\%", "_", "\\_").Replace(s)
 }
 
 // ---------------------------------------------------------------------------
