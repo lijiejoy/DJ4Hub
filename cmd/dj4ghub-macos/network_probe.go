@@ -8,8 +8,6 @@ import (
 	"net/http"
 	"syscall"
 	"time"
-
-	"golang.org/x/sys/unix"
 )
 
 const (
@@ -90,7 +88,7 @@ func probeHTTPFromInterface(ctx context.Context, interfaceName string, sourceIPv
 		Control: func(_, _ string, connection syscall.RawConn) error {
 			var socketErr error
 			if err := connection.Control(func(fd uintptr) {
-				socketErr = unix.SetsockoptInt(int(fd), unix.IPPROTO_IP, unix.IP_BOUND_IF, interfaceInfo.Index)
+				socketErr = bindCellularSocket(fd, interfaceInfo.Index)
 			}); err != nil {
 				return err
 			}
