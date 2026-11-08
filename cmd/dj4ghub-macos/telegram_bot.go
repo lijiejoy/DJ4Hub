@@ -44,8 +44,26 @@ func confirmCodeFrom(reader io.Reader) (string, error) {
 	return strconv.Itoa(int(n.Int64()) + 100000), nil
 }
 
+// telegramPollFailureTracker throttles the bot poll failure log: a single
+// transient failure (for example a long-poll connection closed by the remote
+// end every few minutes) stays silent, and a persistent problem is reported
+// once it has failed three times in a row, then every ten failures.
+type telegramPollFailureTracker struct {
+	consecutive int
+}
+
+func (t *telegramPollFailureTracker) noteFailure() (logNow bool, count int) {
+	t.consecutive++
+	return t.consecutive == 3 || t.consecutive%10 == 0, t.consecutive
+}
+
+func (t *telegramPollFailureTracker) noteSuccess() {
+	t.consecutive = 0
+}
+
 func (a *app) telegramBotLoop() {
 	client := &http.Client{Timeout: 40 * time.Second}
+	var failures telegramPollFailureTracker
 	for {
 		if a.backgroundContext().Err() != nil {
 			return
@@ -58,10 +76,14 @@ func (a *app) telegramBotLoop() {
 			continue
 		}
 		if err := a.telegramPollOnce(client, cfg); err != nil {
-			log.Printf("[notify] telegram bot poll failed: %v", err)
+			if logNow, count := failures.noteFailure(); logNow {
+				log.Printf("[notify] telegram bot poll failed %d times in a row: %v", count, err)
+			}
 			if !waitBackground(a.backgroundContext(), 5*time.Second) {
 				return
 			}
+		} else {
+			failures.noteSuccess()
 		}
 	}
 }
@@ -95,6 +117,10 @@ func (a *app) telegramPollOnce(client *http.Client, cfg *notifySettings) (failur
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if resp.StatusCode == http.StatusConflict {
+			// Another getUpdates session is active for this bot token.
+			return notificationError{message: "telegram：已有其他轮询会话在运行"}
+		}
 		return fmt.Errorf("getUpdates HTTP %d", resp.StatusCode)
 	}
 	var decoded struct {
