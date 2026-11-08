@@ -4,6 +4,18 @@ package sip
 
 import "errors"
 
+// AudioDevice mirrors the darwin+cgo definition in native_audio_darwin.go.
+// It is duplicated here (rather than shared) because this file builds when
+// cgo is off, where the CoreAudio-backed definition is unavailable. The
+// fields must stay in sync: ListLocalAudioDevices returns it on both paths.
+type AudioDevice struct {
+	Name      string `json:"name"`
+	UID       string `json:"uid"`
+	HasInput  bool   `json:"has_input"`
+	HasOutput bool   `json:"has_output"`
+	Transport int    `json:"transport,omitempty"`
+}
+
 func nativeAudioAuthorization() string { return "unsupported" }
 
 func nativeRequestAudioPermission() error {

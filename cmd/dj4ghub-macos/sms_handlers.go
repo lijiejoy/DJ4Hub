@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"github.com/WongLoki/DJ4Hub/pkg/smscodec"
 	"log"
 	"net/http"
 	"sort"
@@ -14,6 +15,9 @@ type receivedSMS struct {
 	Content   string    `json:"content"`
 	Code      string    `json:"code,omitempty"`
 	Timestamp time.Time `json:"timestamp"`
+	// Concat carries long-SMS reassembly metadata (USB-AT path only);
+	// nil for single-part messages. Persisted to history for dedup.
+	Concat *smscodec.ConcatInfo `json:"-"`
 }
 
 func (a *app) recordSMS(sender, content string, timestamp time.Time) {
@@ -22,7 +26,7 @@ func (a *app) recordSMS(sender, content string, timestamp time.Time) {
 	}})
 }
 
-func (a *app) mergeSMS(messages []receivedSMS) (newCount int, total int) {
+func (a *app) mergeSMS(messages []receivedSMS) (newCount int, total int, persistErr error) {
 	a.smsMu.Lock()
 	defer a.smsMu.Unlock()
 	newItems := make([]receivedSMS, 0, len(messages))
@@ -51,7 +55,10 @@ func (a *app) mergeSMS(messages []receivedSMS) (newCount int, total int) {
 	}
 	// Batch 1: newly accepted messages notify (recency-guarded inside).
 	a.notifyNewSMS(newItems)
-	return newCount, len(a.sms)
+	// 交付点 2：先落盘后清理的前提——新短信先持久化；落盘失败
+	// 由调用方（pollSMSOnce）据此跳过模块清理。内存缓存不受影响。
+	persistErr = a.persistReceivedSMS(newItems)
+	return newCount, len(a.sms), persistErr
 }
 
 func smsCacheKey(item receivedSMS) string {
@@ -103,10 +110,13 @@ func (a *app) pollSMSOnce() error {
 		a.setSMSPollStatus(err)
 		return err
 	}
-	newCount, total := a.mergeSMS(messages)
+	newCount, total, persistErr := a.mergeSMS(messages)
 	if a.smsAutoCleanupME && len(messages) > 0 {
-		before, after, cleanupErr := a.clearUSBATSMSMemory("ME")
-		if cleanupErr != nil {
+		if persistErr != nil {
+			// 落盘失败：保留模块数据，跳过本轮清理；故障由
+			// /api/sms/status 的 history_error 对外显示。
+			log.Printf("skip auto cleanup ME SMS: history persist failed (%v); module data kept", persistErr)
+		} else if before, after, cleanupErr := a.clearUSBATSMSMemory("ME"); cleanupErr != nil {
 			log.Printf("auto cleanup ME SMS failed: %v", cleanupErr)
 		} else if before != after {
 			log.Printf("auto cleanup ME SMS: %d -> %d", before, after)
@@ -142,6 +152,7 @@ func (a *app) smsStatus(w http.ResponseWriter, _ *http.Request) {
 		"auto_cleanup_me": a.smsAutoCleanupME,
 		"last_poll":       lastPoll,
 		"last_poll_error": lastPollError,
+		"history_error":   historyLastErrorString(),
 	})
 }
 
@@ -206,14 +217,18 @@ func (a *app) sendSMS(w http.ResponseWriter, r *http.Request) {
 	if a.demo {
 		a.recordSMS("已发送至 "+body.Phone, body.Message, time.Now())
 		a.recordSentSMS(body.Phone, []int{-1})
+		a.recordOutboxAttempt(body.Phone, body.Message, 1, []int{-1}, nil)
 		writeJSON(w, http.StatusOK, map[string]any{"sent": true, "segments": 1})
 		return
 	}
 	segments, mrs, err := a.sendTextSMS(body.Phone, body.Message)
 	if err != nil {
+		// 发件箱记 uncertain（无法证明未发送），永不自动补发。
+		a.recordOutboxAttempt(body.Phone, body.Message, segments, mrs, err)
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
 	a.recordSentSMS(body.Phone, mrs)
+	a.recordOutboxAttempt(body.Phone, body.Message, segments, mrs, nil)
 	writeJSON(w, http.StatusOK, map[string]any{"sent": true, "segments": segments, "message_refs": mrs})
 }

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -442,8 +443,8 @@ func (a *app) recordSentSMS(to string, mrs []int) {
 // recorded here (e.g. sent before a restart).
 func (a *app) recordDeliveryReport(rep modem.SMSDeliveryReport) {
 	a.deliveryMu.Lock()
-	defer a.deliveryMu.Unlock()
 	now := time.Now()
+	matched := false
 	for i := range a.delivery {
 		if rep.MessageRef >= 0 && a.delivery[i].MessageRef == rep.MessageRef {
 			rec := &a.delivery[i]
@@ -455,29 +456,48 @@ func (a *app) recordDeliveryReport(rep modem.SMSDeliveryReport) {
 				dt := rep.DischargeTime
 				rec.DischargeTime = &dt
 			}
-			return
+			matched = true
+			break
 		}
 	}
-	a.deliverySeq++
-	dt := rep.DischargeTime
-	rec := smsDeliveryRecord{
-		ID:         fmt.Sprintf("sms-%d-%d", now.UnixMilli(), a.deliverySeq),
-		MessageRef: rep.MessageRef,
-		To:         rep.Recipient,
-		State:      rep.State,
-		Status:     rep.Status,
-		StatusText: rep.StatusText,
-		SentAt:     now,
-		UpdatedAt:  now,
+	if !matched {
+		a.deliverySeq++
+		dt := rep.DischargeTime
+		rec := smsDeliveryRecord{
+			ID:         fmt.Sprintf("sms-%d-%d", now.UnixMilli(), a.deliverySeq),
+			MessageRef: rep.MessageRef,
+			To:         rep.Recipient,
+			State:      rep.State,
+			Status:     rep.Status,
+			StatusText: rep.StatusText,
+			SentAt:     now,
+			UpdatedAt:  now,
+		}
+		if !rep.DischargeTime.IsZero() {
+			rec.DischargeTime = &dt
+		}
+		a.delivery = append([]smsDeliveryRecord{rec}, a.delivery...)
+		if len(a.delivery) > 500 {
+			a.delivery = a.delivery[:500]
+		}
+		log.Printf("SMS delivery report: MR=%d to=%s state=%s", rep.MessageRef, rep.Recipient, rep.State)
 	}
-	if !rep.DischargeTime.IsZero() {
-		rec.DischargeTime = &dt
+	a.deliveryMu.Unlock()
+	if rep.State == "delivered" && rep.MessageRef >= 0 {
+		a.markOutboxDelivered(rep.MessageRef)
 	}
-	a.delivery = append([]smsDeliveryRecord{rec}, a.delivery...)
-	if len(a.delivery) > 500 {
-		a.delivery = a.delivery[:500]
+}
+
+// markOutboxDelivered flips a submitted/uncertain outbox attempt to
+// delivered when a +CDS report says so. Best effort and deliberately
+// outside deliveryMu: a missing store or no matching attempt leaves the
+// outbox state untouched (never falsely delivered).
+func (a *app) markOutboxDelivered(ref int) {
+	store, err := a.historyStore()
+	if err != nil {
+		return
 	}
-	log.Printf("SMS delivery report: MR=%d to=%s state=%s", rep.MessageRef, rep.Recipient, rep.State)
+	_, _ = store.MarkOutboxDeliveredByRef(context.Background(), ref)
 }
 
 // listDeliveryReports returns the per-message delivery states, newest first.

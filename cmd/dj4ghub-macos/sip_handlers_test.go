@@ -99,6 +99,14 @@ func TestSipAudioDevicesHandler(t *testing.T) {
 	routes := instance.routes()
 
 	w := doSipJSON(t, routes, http.MethodGet, "/api/sip/audio-devices", "")
+	if w.Code == http.StatusServiceUnavailable {
+		// No-cgo build: CoreAudio enumeration is unavailable and the
+		// endpoint honestly reports it. That 503 is expected here.
+		if !strings.Contains(w.Body.String(), "cgo") {
+			t.Fatalf("GET audio devices without cgo: unexpected body %s", w.Body.String())
+		}
+		t.Skip("audio device listing requires macOS with cgo enabled")
+	}
 	if w.Code != http.StatusOK {
 		t.Fatalf("GET audio devices: status %d body %s", w.Code, w.Body.String())
 	}

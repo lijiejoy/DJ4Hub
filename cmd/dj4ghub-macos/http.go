@@ -15,6 +15,7 @@ func (a *app) routes() http.Handler {
 	mux.HandleFunc("GET /api/health", a.health)
 	mux.HandleFunc("GET /api/status", a.status)
 	a.registerSubscriptionRoutes(mux)
+	a.registerHistoryRoutes(mux)
 	a.registerDiagnosticsRoutes(mux)
 	mux.HandleFunc("GET /api/sms", a.listSMS)
 	mux.HandleFunc("GET /api/sms/status", a.smsStatus)

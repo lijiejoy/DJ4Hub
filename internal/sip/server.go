@@ -95,6 +95,9 @@ type Call struct {
 	answered       bool
 	sipLeg         bool
 	onState        func(PublicCall)
+	// onHistory is HistorySink captured when the call was created
+	// (same timing convention as onState).
+	onHistory func(PublicCall)
 }
 
 // pendingDialog is one outbound INVITE leg awaiting a response.
@@ -260,13 +263,17 @@ func (c *Call) setStateReason(state CallState, reason CallEndReason, err string)
 		c.Error = err
 	}
 	notify := c.onState
+	historyNotify := c.onHistory
 	var snapshot PublicCall
-	if changed && notify != nil {
+	if changed && (notify != nil || historyNotify != nil) {
 		snapshot = c.publicLocked()
 	}
 	c.mu.Unlock()
 	if changed && notify != nil {
 		notify(snapshot)
+	}
+	if changed && historyNotify != nil {
+		historyNotify(snapshot)
 	}
 }
 
@@ -336,6 +343,11 @@ type Server struct {
 	// (idx 2 survives ATH while CPAS reads 0) and never describe a call.
 	ModemCallState func() (ModemCallState, error)
 	OnCallState    func(PublicCall)
+	// HistorySink, when set, receives every call-state event (the same
+	// PublicCall snapshots OnCallState gets). Delivery 2 installs it
+	// lazily from the history store; it only records history and never
+	// drives call control. Nil by default: no history, no behaviour change.
+	HistorySink func(PublicCall)
 
 	mu            sync.Mutex
 	conn          *net.UDPConn
@@ -972,6 +984,9 @@ func (s *Server) DialFromAPI(number string) (string, error) {
 	if s.OnCallState != nil {
 		s.OnCallState(call.public())
 	}
+	if s.HistorySink != nil {
+		s.HistorySink(call.public())
+	}
 	if s.Dial == nil {
 		call.setStateReason(CallStateFailed, EndReasonNoNetwork, ErrNoModem.Error())
 		return call.ID, ErrNoModem
@@ -1120,6 +1135,7 @@ func (s *Server) newCallLocked(direction, number string) *Call {
 		connectedCh: make(chan struct{}), cancelCh: make(chan struct{}),
 		pendingDialogs: map[string]pendingDialog{},
 		onState:        s.OnCallState,
+		onHistory:      s.HistorySink,
 	}
 	call.mediaCheck = func() bool { return s.mediaReadyFor(call) }
 	s.calls[call.ID] = call
