@@ -350,7 +350,13 @@ func TestRTPAllocateAndSilence(t *testing.T) {
 	if seqs[1] != seqs[0]+1 || seqs[2] != seqs[1]+1 {
 		t.Fatalf("sequence not incrementing: %v", seqs)
 	}
+	// UDP delivery can precede the sender's accounting update.
+	txDeadline := time.Now().Add(2 * time.Second)
 	stats := sess.Stats()
+	for stats.TXPackets < 3 && time.Now().Before(txDeadline) {
+		time.Sleep(10 * time.Millisecond)
+		stats = sess.Stats()
+	}
 	if stats.TXPackets < 3 || !stats.Running {
 		t.Fatalf("stats = %+v", stats)
 	}
