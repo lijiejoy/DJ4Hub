@@ -1,7 +1,7 @@
 import Foundation
 
 struct TrafficHistory {
-    private var previous: (time: Double, rx: Double, tx: Double, interface: String)?
+    private var previous: (time: Double, rx: Double, tx: Double, interface: String, counterID: String)?
     private(set) var download: [Double] = []
     private(set) var upload: [Double] = []
     mutating func record(_ value: HubValue) {
@@ -11,8 +11,9 @@ struct TrafficHistory {
             previous = nil; download = []; upload = []; return
         }
         let interface = value["interface"].text
-        defer { previous = (time, rx, tx, interface) }
-        guard let last = previous, last.interface == interface, time > last.time,
+        let counterID = value["counter_id"].text
+        defer { previous = (time, rx, tx, interface, counterID) }
+        guard let last = previous, last.interface == interface, last.counterID == counterID, time > last.time,
               time - last.time <= 15000, rx >= last.rx, tx >= last.tx else {
             download = []; upload = []; return
         }

@@ -849,7 +849,9 @@ async function loadNetworkTraffic() {
     let rxRate = 0;
     let txRate = 0;
     const previous = networkTrafficPrevious;
-    if (previous && previous.interface === sample.interface) {
+    if (previous && previous.interface === sample.interface && previous.counter_id === sample.counter_id
+        && Number(sample.rx_bytes) >= Number(previous.rx_bytes)
+        && Number(sample.tx_bytes) >= Number(previous.tx_bytes)) {
       const elapsed = (Number(sample.sampled_at_ms) - Number(previous.sampled_at_ms)) / 1000;
       if (elapsed > 0) {
         rxRate = Math.max(0, Number(sample.rx_bytes) - Number(previous.rx_bytes)) / elapsed;
@@ -862,10 +864,13 @@ async function loadNetworkTraffic() {
     setValue("#traffic-session-rx", formatTrafficBytes(sample.session_rx_bytes), "neutral");
     setValue("#traffic-session-tx", formatTrafficBytes(sample.session_tx_bytes), "neutral");
     setValue("#traffic-session-total", formatTrafficBytes(sample.session_total_bytes), "neutral");
-    $("#traffic-session-total").title = "本次启动期间的下载与上传流量之和；关闭 DJ 4G Hub 后清零";
+    $("#traffic-session-total").title = "当前网卡连接自首次统计起的下载与上传流量之和；服务重启或网卡重新连接后重新统计";
   } catch (error) {
+    networkTrafficPrevious = null;
     setValue("#traffic-rx-rate", "--", "muted");
     setValue("#traffic-tx-rate", "--", "muted");
+    setValue("#traffic-session-rx", "--", "muted");
+    setValue("#traffic-session-tx", "--", "muted");
     setValue("#traffic-session-total", "--", "muted");
   } finally {
     networkTrafficInFlight = false;
