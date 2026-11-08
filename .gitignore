@@ -18,3 +18,30 @@
 
 # Frontend dependencies are not used by the native DJ 4G Hub page
 node_modules/
+
+# In-tree build outputs belong in dist/ (rebuild via scripts/build-macos.sh)
+cmd/dj4ghub-macos/dj4ghub-macos
+
+# Local agent/tooling workspace
+.zwork/
+
+# Local browser verification artifacts
+/.playwright-cli/
+/output/
+
+# Per-machine settings, credentials, recordings and signing identities
+.env
+.env.*
+!.env.example
+*.p12
+*.pfx
+*.key
+/com.dj4hub.local.plist
+/sip-password
+/mcp-token
+/sip-config.json
+/notifications.json
+/radio-prefs.json
+/tasks.json
+/module-voice/
+/recordings/

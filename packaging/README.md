@@ -1,6 +1,6 @@
 # DJ 4G Hub for macOS（Apple Silicon）
 
-这是 DJ 4G Hub 的完整便携发行包，已经包含程序、启动器和 `libusb`，无需安装 Go 或 Homebrew。
+这是旧版 CLI 便携发行包，包含后台程序、终端启动器和 `libusb`，无需安装 Go 或 Homebrew。它不包含 Swift 状态栏和 ADB；完整通话 App 请使用仓库的 `package-macos-app.sh` 产物。
 
 ## 安装
 

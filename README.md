@@ -6,7 +6,7 @@
 
 DJ 4G Hub 是一个本地优先的 macOS 设备控制台，支持兼容的 **DJI 4G 模块**。它通过模块已有的 USB 接口，在 Mac 上提供设备状态、短信、eSIM Profile、蜂窝上网、网络活动和 AT 调试能力，不修改模块固件。
 
-管理服务和网页均运行在本机，默认只监听 `127.0.0.1:7575`。SIM、短信、EID、ICCID 和网络连接信息不会由项目主动上传到远程服务器。
+管理服务和网页均运行在本机，默认只监听 `127.0.0.1:7575`。设备数据默认保存在本机；启用通知推送后，短信和来电信息会按你的配置发送到对应服务。eSIM 下载和语音环境准备也需要相应的网络请求。
 
 > [!IMPORTANT]
 > DJ 4G Hub 是独立开发的非官方开源项目，未获得 DJI 的授权、赞助或认可，与 DJI、Quectel、运营商或 eSIM 卡片厂商不存在隶属或合作关系。DJI 及相关产品名称是其各自权利人的商标，仅用于说明兼容性。
@@ -73,6 +73,12 @@ git submodule update --init --recursive
 
 ## 功能状态
 
+当前开发工作区的新增功能、通话进展与逐项检查见 [2026-11-07 功能梳理与排查报告](docs/2026-11-07-feature-audit.md)。报告区分实机读取、自动测试和仍需业务验收的能力，不代表已发布版本状态。
+
+后续已实施的优化、自动测试、27 个本机只读接口结果及未完成验收项见 [功能优化与逐项验证记录](docs/2026-11-07-feature-optimization-and-verification.md)。
+
+本地开发版现已支持状态栏“4G → 拨打电话”及接听后保留的原生通话面板，包含数字键盘、静音、扬声器开关和挂断，详见 [原生通话面板与验证记录](docs/2026-11-07-native-call-panel.md)。
+
 | 功能 | 状态 | 说明 |
 | --- | --- | --- |
 | 设备自动识别 | 可用 | 识别受支持的 DJI 4G 模块，处理拔出与重新连接 |
@@ -83,7 +89,7 @@ git submodule update --init --recursive
 | 联网活动 | 可用 | 展示连接元数据，不读取 HTTPS 页面内容 |
 | AT 调试 | 可用 | 直接向模块发送 AT 指令 |
 | Apple Silicon | 可用 | 当前发行包面向 macOS 13+、M 系列芯片 |
-| Intel Mac | 未验证 | 尚未发布经过真机验证的发行包 |
+| Intel Mac | 开发版验证 | 本机构建、自动测试及设备读取通过，正式发布与完整业务验收仍需完成 |
 | iPhone / iPad | 规划中 | 需要独立的移动端架构、权限和安全设计 |
 
 ## 硬件与系统
@@ -107,6 +113,19 @@ git submodule update --init --recursive
 切换模式会触发 USB 重新枚举，页面短暂显示断开属于正常现象。不要在 eSIM Profile 写入过程中拔出模块或切换模式。
 
 ## 下载与安装
+
+当前开发版新增单一 `DJ 4G Hub.app`：状态栏、原生通话面板、后台设备服务、ADB 和 libusb 一起安装。
+本地构建与迁移到 `/Applications`：
+
+```sh
+sh scripts/build-macos-app.sh
+sh scripts/install-macos-app.sh
+```
+
+打开 App 即可启动服务；退出状态栏后后台继续接听，菜单可单独停止服务。
+旧安装的设置继续保留。当前采用临时签名，更新后系统可能再次要求麦克风授权。
+完整行为、验证记录和边界见 [单一 App 整合说明](docs/2026-11-07-unified-macos-app.md)。
+以下是现有 arm64 CLI 发行包的安装方式。
 
 从项目 [Releases](https://github.com/WongLoki/DJ4Hub/releases) 下载名称包含 `DJ-4G-Hub-macOS-arm64` 的 ZIP，并按需使用同名 `.sha256` 校验文件。只需要一次性激活工具时，请前往 [4G Connect Releases](https://github.com/WongLoki/4G-Connect/releases)。
 
@@ -205,24 +224,34 @@ Profile 号码备注会兼容读取旧的 `DJOneHub` 和 `VoHive macOS` 数据�
 
 ## 从源码开发
 
+需要 Go（版本见 `go.mod`）、Xcode Command Line Tools/Swift、`libusb`、`pkg-config`。完整 App 还需要 Android platform-tools 中的 ADB 和 NOTICE；源码检查需要 Node.js，App 构建需要 `rg`。
+
 ```sh
-go test ./...
-./scripts/build-macos.sh
-./scripts/package-macos-arm64.sh v0.1.0-preview
+brew install go pkg-config libusb node ripgrep
+brew install --cask android-platform-tools
+make check test test-client
+make app
 ```
+
+输出为 `dist/DJ 4G Hub.app`。`make package-app VERSION=v1.1.0` 为当前 Mac 的架构生成 App ZIP 与校验文件；`make help` 查看其他命令。原 `scripts/package-macos-arm64.sh` 继续保留为旧版 CLI 打包入口。
 
 主要目录：
 
 ```text
 cmd/dj4ghub-macos/       macOS 服务、USB AT 和内嵌网页
+cmd/dj4hub-client/       Swift 状态栏与服务安装/管理
+cmd/dj4hub-call-test/    显式启用的音频/电话诊断工具
 apps/4g-connect/         独立 4G Connect 仓库的 submodule 引用
 internal/                设备后端、短信、eSIM 与配置能力
 pkg/                     MBIM、短信编码和日志组件
 packaging/               安装器、启动器与发行说明
-scripts/                 本地构建和 Apple Silicon 打包脚本
+scripts/                 检查、测试、构建与打包
+docs/                    功能文档、验证记录与维护指南
 ```
 
-DJ 4G Hub 在本仓库运行测试与发布流程，推送 `v*` 标签时构建 Release。4G Connect 在自己的仓库中运行独立 Actions 和发布流程。
+DJ 4G Hub 在本仓库运行测试与发布流程，推送 `v*` 标签时构建 Intel/Apple Silicon App 并生成 Release 草稿，检查后再发布。云端双架构流程需在上传后运行验证；本机测试不能代替云端结果。4G Connect 在自己的仓库中运行独立 Actions 和发布流程。
+
+开发约定见 [CONTRIBUTING.md](CONTRIBUTING.md)，入口索引见 [文档目录](docs/README.md)，上传与版本维护步骤见 [GitHub 维护指南](docs/github-maintenance.md)。
 
 ## 移动设备路线图
 
@@ -237,7 +266,7 @@ DJ 4G Hub 在本仓库运行测试与发布流程，推送 `v*` 标签时构建 
 
 ## 当前限制
 
-- 发行包目前只支持 Apple Silicon。
+- 旧 CLI 打包入口面向 Apple Silicon；完整 App 提供 Intel/Apple Silicon 构建流程，双架构云端发布仍需首次运行验证。
 - 不同 SIM、eUICC、运营商、漫游环境和模块固件可能存在差异。
 - 联网活动只显示连接元数据，不能看到 HTTPS 内容，也不等同于运营商账单。
 - 当前发行包使用临时签名，尚未经过 Apple Developer ID 公证。

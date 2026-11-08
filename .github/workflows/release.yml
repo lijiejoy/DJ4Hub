@@ -5,32 +5,65 @@ on:
     tags: ['v*']
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  release-macos-arm64:
-    runs-on: macos-14
+  build-app:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: amd64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go.mod
-          cache: false
+          cache: true
       - name: Install build dependencies
-        run: brew install pkg-config libusb
+        run: |
+          brew install pkg-config libusb
+          brew install --cask android-platform-tools
       - name: Test
-        run: go test ./...
-        env:
-          PKG_CONFIG_PATH: /opt/homebrew/lib/pkgconfig
-      - name: Build release archive
-        run: ./scripts/package-macos-arm64.sh "${GITHUB_REF_NAME}"
-      - name: Publish GitHub Release
+        run: make check test test-client
+      - name: Build complete app archive
+        run: sh scripts/package-macos-app.sh "${GITHUB_REF_NAME}"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: app-${{ matrix.arch }}
+          path: |
+            dist/release/DJ-4G-Hub-App-macOS-${{ matrix.arch }}-${{ github.ref_name }}.zip
+            dist/release/DJ-4G-Hub-App-macOS-${{ matrix.arch }}-${{ github.ref_name }}.zip.sha256
+          if-no-files-found: error
+
+  draft-release:
+    needs: build-app
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          pattern: app-*
+          merge-multiple: true
+          path: release-assets
+      - name: Create draft release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          version="${GITHUB_REF_NAME}"
-          gh release create "${GITHUB_REF_NAME}" \
-            "dist/release/DJ-4G-Hub-macOS-arm64-${version}.zip" \
-            "dist/release/DJ-4G-Hub-macOS-arm64-${version}.zip.sha256" \
+          gh release create "${GITHUB_REF_NAME}" release-assets/* \
+            --verify-tag \
+            --draft \
             --generate-notes \
-            --title "DJ 4G Hub ${version}"
+            --title "DJ 4G Hub ${GITHUB_REF_NAME}"

@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Reference only. The app generates the actual LaunchAgent for the current user.
+  Replace __HOME__ with an absolute home path before using this example.
+  launchd does not expand shell variables or a tilde in plist values.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.dj4hub.local</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Applications/DJ 4G Hub.app/Contents/MacOS/dj4ghub-macos</string>
+	</array>
+	<key>WorkingDirectory</key>
+	<string>__HOME__/Library/Application Support/DJ 4G Hub</string>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>StandardOutPath</key>
+	<string>__HOME__/Library/Logs/DJ 4G Hub/dj4ghub-launchd.log</string>
+	<key>StandardErrorPath</key>
+	<string>__HOME__/Library/Logs/DJ 4G Hub/dj4ghub-launchd.log</string>
+</dict>
+</plist>
