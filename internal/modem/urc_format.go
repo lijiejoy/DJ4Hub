@@ -3,6 +3,8 @@ package modem
 import (
 	"fmt"
 	"strings"
+
+	"github.com/WongLoki/DJ4Hub/pkg/smscodec"
 )
 
 type urcLogLevel int
@@ -190,6 +192,14 @@ func (m *Manager) formatURC(line string) urcFormatResult {
 		out.Level = urcLogInfo
 		out.Msg = "URC: USSD"
 		out.Fields = append(out.Fields, "n", n, "dcs", dcs, "text", text)
+		return out
+
+	case "+CDS":
+		// 送达报告 header：PDU 在下一行，见 delivery.go 的 pending-CDS 机制。
+		length, _ := smscodec.ParseCDSHeader(s)
+		out.Level = urcLogInfo
+		out.Msg = "URC: 短信送达报告"
+		out.Fields = append(out.Fields, "length", length)
 		return out
 
 	case "+CLIP":

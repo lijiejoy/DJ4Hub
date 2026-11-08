@@ -1448,8 +1448,11 @@ func TestNotifyModemResetClearsOverviewAndDiscoveredEUICCs(t *testing.T) {
 
 func TestNotifyModemResetDelayedClearsCacheImmediatelyAndReloadsAfterDelay(t *testing.T) {
 	loaded := make(chan struct{}, 1)
+	release := make(chan struct{})
+	defer close(release)
 	mgr := newTestManagerWithOverviewLoader(func() (*EsimOverview, error) {
 		loaded <- struct{}{}
+		<-release
 		return &EsimOverview{ChipInfo: &EUICCChipInfo{SkuName: "reloaded"}}, nil
 	})
 	mgr.overviewCache = &EsimOverview{ChipInfo: &EUICCChipInfo{SkuName: "cached"}}

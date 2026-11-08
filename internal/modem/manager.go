@@ -9,18 +9,17 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
-	"unicode/utf16"
 
 	"github.com/WongLoki/DJ4Hub/internal/apduarbiter"
 	"github.com/WongLoki/DJ4Hub/internal/config"
 	"github.com/WongLoki/DJ4Hub/pkg/logger"
 	"github.com/WongLoki/DJ4Hub/pkg/smscodec"
-	"github.com/warthog618/sms/encoding/gsm7"
 
 	"go.bug.st/serial"
 )
@@ -126,6 +125,13 @@ type Manager struct {
 
 	// USSD 会话通道：当有协程在等待 USSD 响应时，+CUSD URC 会被投递到此通道
 	ussdChan chan USSDResult
+
+	// SMS 送达报告 (+CDS)：header 行先到，PDU 行随后到，见 delivery.go
+	cdsMu            sync.Mutex
+	deliveryCallback DeliveryReportCallback
+	awaitingCDS      bool
+	cdsLen           int
+	cdsSince         time.Time
 
 	// RDY 事件订阅（模组重启后广播）
 	rdyMu   sync.Mutex
@@ -621,6 +627,11 @@ func (m *Manager) runLoop() {
 				m.notifyDisconnect("serial_read_error")
 				return
 			}
+			// +CDS 送达报告的 PDU 行（header 行已由 handleURC 登记）
+			if rep, ok := m.takePendingCDS(msg.Data); ok {
+				m.dispatchDeliveryReport(rep)
+				continue
+			}
 			if m.isURC(msg.Data) {
 				m.handleURC(msg.Data)
 			}
@@ -665,6 +676,12 @@ RespLoop:
 			}
 
 			line := msg.Data
+
+			// +CDS 送达报告的 PDU 行：消费后不进入命令响应，也不按 URC 分发。
+			if rep, ok := m.takePendingCDS(line); ok {
+				m.dispatchDeliveryReport(rep)
+				continue
+			}
 
 			if line == "OK" {
 				m.resetATTimeoutWatchdog()
@@ -717,7 +734,7 @@ RespLoop:
 				isPureAsyncURC := func(s string) bool {
 					key := urcKey(s)
 					switch key {
-					case "+CUSD", "+CMTI", "RING", "+CLIP", "+QSIMSTAT", "+QSTKURC", "+QPCMV":
+					case "+CUSD", "+CDS", "+CMTI", "RING", "+CLIP", "+QSIMSTAT", "+QSTKURC", "+QPCMV":
 						return true
 					}
 					return false
@@ -863,7 +880,7 @@ func (m *Manager) initModem() {
 	initCmds := []string{
 		"ATE0",              // 关闭回显
 		"AT+CMGF=0",         // PDU 模式
-		"AT+CNMI=2,1,0,0,0", // 新短信上报 +CMTI
+		"AT+CNMI=2,1,0,1,0", // 新短信上报 +CMTI；<ds>=1 时送达报告以 +CDS URC 上报
 		"AT+CLIP=1",         // 启用来电号码显示 (+CLIP URC)
 		"AT+QPCMV=1,2",      // 开启 UAC 语音模式 (PCM → ALSA 桥接必须)
 	}
@@ -1367,6 +1384,15 @@ func (m *Manager) handleURC(line string) {
 		}
 	}
 
+	// 分发 +CDS 送达报告：header 行先到，PDU 行随后到（见 delivery.go）。
+	// 这里只记下待处理状态，真正的 PDU 由 runLoop/handleCommand 在下一行
+	// 到达时经 takePendingCDS 消费；收不到 PDU 时状态 10 秒后过期。
+	if fr.Key == "+CDS" {
+		if length, ok := smscodec.ParseCDSHeader(s); ok {
+			m.noteCDSHeader(length)
+		}
+	}
+
 	if fr.Key == "+CMTI" && fr.CMTIIndex != "" {
 		index := fr.CMTIIndex
 		storage := fr.CMTIStorage
@@ -1654,6 +1680,17 @@ func (m *Manager) decodePDU(raw string) (sender, content string, timestamp time.
 		if len(b) > smscLen+1 {
 			b = b[smscLen+1:]
 		}
+	}
+
+	// 存储的送达报告（TP-MTI=10）不是收件箱短信：解码后走送达回调，
+	// 返回空内容，调用方按“无内容”处理（删除该条、不回调短信）。
+	if smscodec.IsStatusReportTPDU(b) {
+		if rep, err := smscodec.DecodeStatusReportTPDU(b); err == nil {
+			m.dispatchDeliveryReport(smsDeliveryReportFromCodec(rep))
+		} else {
+			logger.Warn(fmt.Sprintf("[%s] 送达报告解析失败", m.cfg.ID), "err", err)
+		}
+		return "", "", time.Time{}
 	}
 
 	var concat smscodec.ConcatInfo
@@ -1963,6 +2000,35 @@ func (m *Manager) SendSMS(phone, message string) error {
 
 // SendSMSWithOptions 使用 PDU 模式发送短信，并允许调用方指定文本编码策略。
 func (m *Manager) SendSMSWithOptions(phone, message string, opts smscodec.SubmitOptions) error {
+	_, err := m.SendSMSWithOptionsAndMR(phone, message, opts)
+	return err
+}
+
+var cmgsRefRe = regexp.MustCompile(`\+CMGS:\s*(\d+)`)
+
+// ParseCMGSRef is the exported form of parseCMGSRef, for the USB-AT
+// send path in cmd/dj4ghub-macos.
+func ParseCMGSRef(resp string) int {
+	return parseCMGSRef(resp)
+}
+
+// parseCMGSRef 从 +CMGS 响应中提取消息参考号（TP-MR），用于匹配后续的
+// +CDS 送达报告；没有时返回 -1。
+func parseCMGSRef(resp string) int {
+	match := cmgsRefRe.FindStringSubmatch(resp)
+	if len(match) != 2 {
+		return -1
+	}
+	mr, err := strconv.Atoi(match[1])
+	if err != nil {
+		return -1
+	}
+	return mr
+}
+
+// SendSMSWithOptionsAndMR 与 SendSMSWithOptions 相同，但额外返回每段的
+// +CMGS 消息参考号，供送达报告匹配使用。
+func (m *Manager) SendSMSWithOptionsAndMR(phone, message string, opts smscodec.SubmitOptions) ([]int, error) {
 	m.SetBusy(true)
 	defer m.SetBusy(false)
 
@@ -1970,15 +2036,16 @@ func (m *Manager) SendSMSWithOptions(phone, message string, opts smscodec.Submit
 
 	// 确保处于 PDU 模式
 	if _, err := m.ExecuteATHigh("AT+CMGF=0", 3*time.Second); err != nil {
-		return fmt.Errorf("设置 PDU 模式失败: %w", err)
+		return nil, fmt.Errorf("设置 PDU 模式失败: %w", err)
 	}
 
 	// 构建 PDUs
 	pduHexList, tpduLenList, err := m.buildSMSPDUsWithOptions(phone, message, opts)
 	if err != nil {
-		return fmt.Errorf("构建 PDU 失败: %w", err)
+		return nil, fmt.Errorf("构建 PDU 失败: %w", err)
 	}
 
+	mrs := make([]int, 0, len(pduHexList))
 	for i, pduHex := range pduHexList {
 		tpduLen := tpduLenList[i]
 		logger.Debug(fmt.Sprintf("[%s] PDU 编码完成 (分片 %d/%d)", m.cfg.ID, i+1, len(pduHexList)), "pdu", pduHex, "tpdu_len", tpduLen)
@@ -1998,19 +2065,20 @@ func (m *Manager) SendSMSWithOptions(phone, message string, opts smscodec.Submit
 		select {
 		case m.cmdChanHigh <- req:
 		case <-time.After(5 * time.Second):
-			return errors.New("command queue full")
+			return mrs, errors.New("command queue full")
 		}
 
 		// 等待最终响应 (OK)
 		select {
 		case resp := <-req.respChan:
 			if !strings.Contains(resp, "OK") && !strings.Contains(resp, "+CMGS:") {
-				return fmt.Errorf("发送分片 %d 失败: %s", i+1, resp)
+				return mrs, fmt.Errorf("发送分片 %d 失败: %s", i+1, resp)
 			}
+			mrs = append(mrs, parseCMGSRef(resp))
 		case err := <-req.errChan:
-			return fmt.Errorf("发送分片 %d 失败: %w", i+1, err)
+			return mrs, fmt.Errorf("发送分片 %d 失败: %w", i+1, err)
 		case <-time.After(20 * time.Second):
-			return errors.New("发送超时")
+			return mrs, errors.New("发送超时")
 		}
 
 		// 稍微等待下一段发信，防止模组队列溢出
@@ -2020,7 +2088,7 @@ func (m *Manager) SendSMSWithOptions(phone, message string, opts smscodec.Submit
 	}
 
 	logger.Info(fmt.Sprintf("[%s] 短信已发送", m.cfg.ID))
-	return nil
+	return mrs, nil
 }
 
 // buildSMSPDUs 构建多段 SMS-SUBMIT PDU
@@ -2060,87 +2128,47 @@ type USSDResult struct {
 }
 
 // decodeUSSDText 根据 DCS (Data Coding Scheme) 解码 USSD 文本
-// 参考 3GPP TS 23.038 的编码方案
+// 参考 3GPP TS 23.038 的编码方案；实现见 ussd.go（USB-AT 路径共用）。
 func (m *Manager) decodeUSSDText(raw string, dcs int) string {
-	if raw == "" {
-		return ""
-	}
-
-	// 判断是否为 Hex 字符串（偶数长度、全 hex 字符）
-	isHex := smscodec.IsHexString(raw)
-
-	// DCS 高 4 位判断编码类型
-	// 0x00-0x03 (0-3): GSM 7-bit
-	// 0x04-0x07 (4-7): 8-bit data
-	// 0x08-0x0B (8-11): UCS2
-	// 0x0F (15): GSM 7-bit (unspecified)
-	// 0x48 (72): UCS2
-	codingGroup := (dcs >> 4) & 0x0F
-	alphabet := (dcs >> 2) & 0x03
-
-	isUCS2 := false
-	if codingGroup == 0x00 || codingGroup == 0x01 {
-		// 一般编码组
-		isUCS2 = alphabet == 2 // bit3-2 = 10 -> UCS2
-	} else if dcs == 72 {
-		isUCS2 = true
-	} else if dcs >= 0x40 && dcs <= 0x7F {
-		// 消息类编码组
-		isUCS2 = alphabet == 2
-	}
-
-	if isUCS2 && isHex {
-		// UCS2: Hex 字符串 -> UTF-16BE -> UTF-8
-		b, err := hex.DecodeString(raw)
-		if err != nil {
-			logger.Debug(fmt.Sprintf("[%s] USSD UCS2 hex 解码失败", m.cfg.ID), "err", err, "raw", raw)
-			return raw
-		}
-		if len(b)%2 != 0 {
-			return raw
-		}
-		u16 := make([]uint16, len(b)/2)
-		for i := 0; i < len(b); i += 2 {
-			u16[i/2] = uint16(b[i])<<8 | uint16(b[i+1])
-		}
-		return string(utf16.Decode(u16))
-	}
-
-	if isHex {
-		// 可能是 GSM 7-bit packed 的 hex 表示
-		b, err := hex.DecodeString(raw)
-		if err != nil {
-			return raw
-		}
-		unpacked := gsm7.Unpack7BitUSSD(b, 0)
-		decoded, err := gsm7.Decode(unpacked)
-		if err != nil {
-			return raw
-		}
-		return string(decoded)
-	}
-
-	// 非 Hex 字符串，直接返回原文（某些 Modem 已经做了解码）
-	return raw
+	return DecodeUSSDText(raw, dcs)
 }
 
 // ExecuteUSSD 发送 USSD 指令并等待网络返回结果
 // command: USSD 代码，如 "*100#", "*135#"
 // timeout: 等待 URC 响应的超时时间
 func (m *Manager) ExecuteUSSD(command string, timeout time.Duration) (*USSDResult, error) {
+	cmd, err := BuildCUSDCommand(command)
+	if err != nil {
+		return nil, err
+	}
+
+	// 设置字符集，避免部分模组因使用非 GSM 的短信格式导致发不出去 USSD
+	m.ExecuteATSilent(`AT+CSCS="GSM"`, 2*time.Second)
+
+	logger.Info(fmt.Sprintf("[%s] 开始执行 USSD: %s", m.cfg.ID, command), "timeout", timeout.String())
+	return m.sendCUSDAndWait(cmd, timeout)
+}
+
+// ContinueUSSD 回复一个正在进行的 USSD 会话（AT+CUSD=1,"<reply>",15），
+// 与 MBIM 的 ContinueUSSD 对应；AT 后端之前没有这个方法，多步 USSD
+// 会话只能重发 ExecuteUSSD。
+func (m *Manager) ContinueUSSD(input string, timeout time.Duration) (*USSDResult, error) {
+	cmd, err := BuildCUSDCommand(input)
+	if err != nil {
+		return nil, err
+	}
+	logger.Info(fmt.Sprintf("[%s] 回复 USSD 会话", m.cfg.ID), "timeout", timeout.String())
+	return m.sendCUSDAndWait(cmd, timeout)
+}
+
+// sendCUSDAndWait 发送一条 AT+CUSD 命令并阻塞等待 +CUSD URC 回调。
+func (m *Manager) sendCUSDAndWait(cmd string, timeout time.Duration) (*USSDResult, error) {
 	// 清空可能残留的旧结果
 	select {
 	case <-m.ussdChan:
 	default:
 	}
 
-	logger.Info(fmt.Sprintf("[%s] 开始执行 USSD: %s", m.cfg.ID, command), "timeout", timeout.String())
-
-	// 设置字符集，避免部分模组因使用非 GSM 的短信格式导致发不出去 USSD
-	m.ExecuteATSilent(`AT+CSCS="GSM"`, 2*time.Second)
-
-	// 发送 AT+CUSD=1,"command",15
-	cmd := fmt.Sprintf(`AT+CUSD=1,"%s",15`, command)
 	_, err := m.ExecuteAT(cmd, 5*time.Second)
 	if err != nil {
 		return nil, fmt.Errorf("发送 USSD 指令失败: %w", err)

@@ -20,6 +20,9 @@ const (
 
 type SubmitOptions struct {
 	Encoding SMSEncoding
+	// RequestStatusReport sets TP-SRR in the SUBMIT TPDU first octet, asking
+	// the network to return a SMS-STATUS-REPORT (+CDS) for this message.
+	RequestStatusReport bool
 }
 
 func NormalizeSMSEncoding(raw string) (SMSEncoding, error) {
@@ -148,6 +151,10 @@ func BuildSubmitTPDUsWithOptions(to, text string, opts SubmitOptions) ([][]byte,
 		b, err := pdu.MarshalBinary()
 		if err != nil {
 			return nil, nil, err
+		}
+		if opts.RequestStatusReport && len(b) > 0 {
+			// TP-SRR is bit 5 (0x20) of the SUBMIT first octet.
+			b[0] |= 0x20
 		}
 		bytesList = append(bytesList, b)
 		lenList = append(lenList, len(b))

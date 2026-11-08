@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key>
+  <string>com.dj4hub.audio</string>
+  <key>CFBundleName</key>
+  <string>DJ 4G Hub</string>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>DJ 4G Hub uses your microphone and the connected cellular module audio for phone calls.</string>
+</dict>
+</plist>

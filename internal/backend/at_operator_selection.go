@@ -2,6 +2,8 @@ package backend
 
 import (
 	"context"
+
+	"github.com/WongLoki/DJ4Hub/internal/modem"
 )
 
 // ============================================================================
@@ -13,7 +15,13 @@ func (a *ATBackend) ScanOperators(ctx context.Context) ([]OperatorCandidate, err
 	if err != nil {
 		return nil, err
 	}
+	return MapOperatorScanEntries(entries), nil
+}
 
+// MapOperatorScanEntries maps raw modem scan entries to API candidates.
+// Exported so the USB-AT path (which parses +COPS=? itself) reuses the
+// same mapping instead of duplicating it.
+func MapOperatorScanEntries(entries []modem.OperatorScanEntry) []OperatorCandidate {
 	var candidates []OperatorCandidate
 	for _, entry := range entries {
 		var status string
@@ -54,7 +62,7 @@ func (a *ATBackend) ScanOperators(ctx context.Context) ([]OperatorCandidate, err
 		candidates = append(candidates, candidate)
 	}
 
-	return candidates, nil
+	return candidates
 }
 
 func (a *ATBackend) GetOperatorSelection(ctx context.Context) (OperatorSelection, error) {
@@ -109,6 +117,12 @@ func (a *ATBackend) SetOperatorSelection(ctx context.Context, req SetOperatorSel
 }
 
 func atActToRAT(act int) OperatorAccessTechnology {
+	return ATActToRAT(act)
+}
+
+// ATActToRAT maps a +COPS/+QENG access-technology number to a RAT name.
+// Exported for the USB-AT path, which parses +COPS? itself.
+func ATActToRAT(act int) OperatorAccessTechnology {
 	switch act {
 	case 0:
 		return OperatorRATGSM
@@ -124,6 +138,11 @@ func atActToRAT(act int) OperatorAccessTechnology {
 }
 
 func ratToATAct(rat OperatorAccessTechnology) int {
+	return RATToATAct(rat)
+}
+
+// RATToATAct maps a RAT name to its +COPS access-technology number.
+func RATToATAct(rat OperatorAccessTechnology) int {
 	switch rat {
 	case OperatorRATGSM:
 		return 0
